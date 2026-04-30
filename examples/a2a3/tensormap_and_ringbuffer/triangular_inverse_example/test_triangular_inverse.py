@@ -22,7 +22,7 @@ class TestTriangularInverse(SceneTestCase):
 
     CALLABLE = {
         "orchestration": {
-            "source": "kernels/orchestration/bgemm_orch.cpp",
+            "source": "kernels/orchestration/triangular_inverse_orch.cpp",
             "function_name": "aicpu_orchestration_entry",
             "signature": [D.IN, D.IN, D.OUT, D.IN],
         },
@@ -30,17 +30,10 @@ class TestTriangularInverse(SceneTestCase):
             {
                 "func_id": 0,
                 "name": "GEMM",
-                "source": "kernels/aic/kernel_gemm_tile.cpp",
+                "source": "kernels/aic/kernel_simple_matmul.cpp",
                 "core_type": "aic",
                 "signature": [D.IN, D.IN, D.OUT],
-            },
-            {
-                "func_id": 1,
-                "name": "ADD",
-                "source": "kernels/aiv/kernel_tile_add.cpp",
-                "core_type": "aiv",
-                "signature": [D.INOUT, D.IN],
-            },
+            }
         ],
     }
 
@@ -49,21 +42,21 @@ class TestTriangularInverse(SceneTestCase):
             "name": "Case0",
             "platforms": ["a2a3sim", "a2a3"],
             "config": {"aicpu_thread_num": 2, "block_dim": 20},
-            "params": {"matmul_add_task_num": 500, "incore_data_size": 128, "incore_loop": 4, "grid_k": 2},
+            "params": {"matmul_add_task_num": 1, "incore_data_size": 128, "incore_loop": 1, "grid_k": 1},
         },
         {
             "name": "Case1",
             "manual": True,
             "platforms": ["a2a3sim", "a2a3"],
             "config": {"aicpu_thread_num": 2, "block_dim": 20},
-            "params": {"matmul_add_task_num": 64, "incore_data_size": 128, "incore_loop": 4, "grid_k": 2},
+            "params": {"matmul_add_task_num": 1, "incore_data_size": 128, "incore_loop": 1, "grid_k": 1},
         },
         {
             "name": "Case2",
             "manual": True,
             "platforms": ["a2a3sim", "a2a3"],
             "config": {"aicpu_thread_num": 2, "block_dim": 20},
-            "params": {"matmul_add_task_num": 256, "incore_data_size": 128, "incore_loop": 4, "grid_k": 2},
+            "params": {"matmul_add_task_num": 1, "incore_data_size": 128, "incore_loop": 1, "grid_k": 1},
         },
     ]
 
@@ -72,9 +65,9 @@ class TestTriangularInverse(SceneTestCase):
         incore_loop = params["incore_loop"]
         grid_k = params["grid_k"]
         num_groups = params["matmul_add_task_num"] // grid_k
-        A = torch.randn(num_groups, grid_k, incore_loop, tile_size, tile_size, dtype=torch.float32) * 0.01
-        B = torch.randn(num_groups, grid_k, incore_loop, tile_size, tile_size, dtype=torch.float32) * 0.01
-        C = torch.zeros(incore_loop * num_groups, tile_size, tile_size, dtype=torch.float32)
+        A = torch.randn(tile_size, tile_size, dtype=torch.float32) * 0.1
+        B = torch.randn(tile_size, tile_size, dtype=torch.float32) * 0.1
+        C = torch.zeros(tile_size, tile_size, dtype=torch.float32)
         config = torch.tensor([tile_size, grid_k, num_groups, incore_loop], dtype=torch.int64)
         return TaskArgsBuilder(
             Tensor("A", A.flatten()), Tensor("B", B.flatten()), Tensor("C", C.flatten()), Tensor("config", config)
@@ -85,14 +78,11 @@ class TestTriangularInverse(SceneTestCase):
         incore_loop = params["incore_loop"]
         grid_k = params["grid_k"]
         num_groups = params["matmul_add_task_num"] // grid_k
-        A = args.A.reshape(num_groups, grid_k, incore_loop, tile_size, tile_size)
-        B = args.B.reshape(num_groups, grid_k, incore_loop, tile_size, tile_size)
-        C = args.C.reshape(incore_loop * num_groups, tile_size, tile_size)
+        A = args.A.reshape(tile_size, tile_size)
+        B = args.B.reshape(tile_size, tile_size)
+        C = args.C.reshape(tile_size, tile_size)
         C[:] = 0.0
-        for group in range(num_groups):
-            for k_idx in range(grid_k):
-                for i in range(incore_loop):
-                    C[group * incore_loop + i] += torch.matmul(A[group, k_idx, i], B[group, k_idx, i])
+        C = A @ B
 
 
 if __name__ == "__main__":
