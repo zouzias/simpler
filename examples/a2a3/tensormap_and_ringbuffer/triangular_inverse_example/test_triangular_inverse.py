@@ -42,47 +42,42 @@ class TestTriangularInverse(SceneTestCase):
             "name": "Case0",
             "platforms": ["a2a3sim", "a2a3"],
             "config": {"aicpu_thread_num": 2, "block_dim": 20},
-            "params": {"matmul_add_task_num": 1, "incore_data_size": 128, "incore_loop": 1, "grid_k": 1},
+            "params": {"batch_dim": 4, "incore_data_size": 128},
         },
         {
             "name": "Case1",
             "manual": True,
             "platforms": ["a2a3sim", "a2a3"],
             "config": {"aicpu_thread_num": 2, "block_dim": 20},
-            "params": {"matmul_add_task_num": 1, "incore_data_size": 128, "incore_loop": 1, "grid_k": 1},
+            "params": {"batch_dim": 4, "incore_data_size": 128},
         },
         {
             "name": "Case2",
             "manual": True,
             "platforms": ["a2a3sim", "a2a3"],
             "config": {"aicpu_thread_num": 2, "block_dim": 20},
-            "params": {"matmul_add_task_num": 1, "incore_data_size": 128, "incore_loop": 1, "grid_k": 1},
+            "params": {"batch_dim": 4, "incore_data_size": 128},
         },
     ]
 
     def generate_args(self, params):
         tile_size = params["incore_data_size"]
-        incore_loop = params["incore_loop"]
-        grid_k = params["grid_k"]
-        num_groups = params["matmul_add_task_num"] // grid_k
-        A = torch.randn(tile_size, tile_size, dtype=torch.float32) * 0.1
-        B = torch.randn(tile_size, tile_size, dtype=torch.float32) * 0.1
-        C = torch.zeros(tile_size, tile_size, dtype=torch.float32)
-        config = torch.tensor([tile_size, grid_k, num_groups, incore_loop], dtype=torch.int64)
+        batch_dim = params["batch_dim"]
+        A = torch.randn(batch_dim, tile_size, tile_size, dtype=torch.float32) * 0.1
+        B = torch.randn(batch_dim, tile_size, tile_size, dtype=torch.float32) * 0.1
+        C = torch.zeros(batch_dim, tile_size, tile_size, dtype=torch.float32)
+        config = torch.tensor([tile_size, batch_dim], dtype=torch.int64)
         return TaskArgsBuilder(
             Tensor("A", A.flatten()), Tensor("B", B.flatten()), Tensor("C", C.flatten()), Tensor("config", config)
         )
 
     def compute_golden(self, args, params):
         tile_size = params["incore_data_size"]
-        incore_loop = params["incore_loop"]
-        grid_k = params["grid_k"]
-        num_groups = params["matmul_add_task_num"] // grid_k
-        A = args.A.reshape(tile_size, tile_size)
-        B = args.B.reshape(tile_size, tile_size)
-        C = args.C.reshape(tile_size, tile_size)
-        C[:] = 0.0
+        batch_dim = params["batch_dim"]
+        A = args.A.reshape(batch_dim, tile_size, tile_size)
+        B = args.B.reshape(batch_dim, tile_size, tile_size)
         C = A @ B
+        return C
 
 
 if __name__ == "__main__":

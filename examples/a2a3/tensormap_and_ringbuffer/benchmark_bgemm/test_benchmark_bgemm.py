@@ -17,8 +17,8 @@ from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
 
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")
 class TestBenchmarkBgemm(SceneTestCase):
-    RTOL = 1e-3
-    ATOL = 1e-3
+    RTOL = 1e-5
+    ATOL = 1e-5
 
     CALLABLE = {
         "orchestration": {
@@ -32,14 +32,14 @@ class TestBenchmarkBgemm(SceneTestCase):
                 "name": "GEMM",
                 "source": "kernels/aic/kernel_gemm_tile.cpp",
                 "core_type": "aic",
-                "signature": [D.IN, D.IN, D.OUT],
+                "signature": [D.IN, D.IN, D.OUT, D.IN],
             },
             {
                 "func_id": 1,
                 "name": "ADD",
                 "source": "kernels/aiv/kernel_tile_add.cpp",
                 "core_type": "aiv",
-                "signature": [D.INOUT, D.IN],
+                "signature": [D.INOUT, D.IN, D.IN],
             },
         ],
     }
