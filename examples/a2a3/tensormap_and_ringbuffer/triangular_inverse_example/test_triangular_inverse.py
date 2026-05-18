@@ -41,21 +41,21 @@ class TestTriangularInverse(SceneTestCase):
         {
             "name": "Case0",
             "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": 2, "block_dim": 20},
+            "config": {"aicpu_thread_num": 4, "block_dim": 16},
             "params": {"batch_dim": 4, "incore_data_size": 128},
         },
         {
             "name": "Case1",
             "manual": True,
             "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": 2, "block_dim": 20},
+            "config": {"aicpu_thread_num": 4, "block_dim": 16},
             "params": {"batch_dim": 4, "incore_data_size": 128},
         },
         {
             "name": "Case2",
             "manual": True,
             "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": 2, "block_dim": 20},
+            "config": {"aicpu_thread_num": 4, "block_dim": 16},
             "params": {"batch_dim": 4, "incore_data_size": 128},
         },
     ]
