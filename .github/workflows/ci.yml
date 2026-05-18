@@ -9,7 +9,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  PTO_ISA_COMMIT: 478daadb
+  PTO_ISA_COMMIT: 50d9c806c3e351d5039c9f0f02a267590420b4d9
 
 jobs:
   # ---------- Pre-commit hooks (format, lint, clang-tidy) ----------
@@ -181,9 +181,15 @@ jobs:
             sudo apt-get install -y ninja-build
             sudo apt-get install -y g++-15 || sudo apt-get install -y g++
             if ! command -v g++-15; then sudo ln -s $(which g++) /usr/local/bin/g++-15; fi
+            # graphviz: required by the dep_gen smoke (deps_to_graph -> dot).
+            # Installed unconditionally so both a2a3 and a5 sim jobs stay
+            # uniform — the dep_gen test is a2a3-only today but the cost is
+            # negligible and the alternative branch sprawls the install logic.
+            sudo apt-get install -y graphviz
           else
             brew install ninja
             brew install gcc@15 || brew install gcc
+            brew install graphviz
           fi
 
       - name: Set up Python ${{ matrix.python-version }}
@@ -207,15 +213,43 @@ jobs:
       - name: Run pytest scene tests (a2a3sim)
         run: |
           set +e
-          pytest examples tests/st --platform a2a3sim --device 0-15 -v --pto-session-timeout 600 --clone-protocol https
+          pytest examples tests/st --platform a2a3sim --device 0-15 -v --pto-session-timeout 600 --clone-protocol https --require-pto-isa
           rc=$?
           if [ $rc -ne 0 ]; then
             echo "pytest failed with rc=$rc; retrying with pinned PTO-ISA commit"
             pytest examples tests/st --platform a2a3sim --device 0-15 -v \
-              --pto-session-timeout 600 --pto-isa-commit ${{ env.PTO_ISA_COMMIT }} --clone-protocol https
+              --pto-session-timeout 600 --pto-isa-commit ${{ env.PTO_ISA_COMMIT }} --clone-protocol https --require-pto-isa
             rc=$?
           fi
           exit $rc
+
+      # DFX per-feature smokes — the default pytest above passes no --enable-*
+      # flag, so each capture pipeline gets its own invocation here. Kept as
+      # separate steps so a failing capture pipeline is attributed to its own
+      # CI step rather than buried in a combined run.
+      - name: dep_gen smoke
+        run: |
+          pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py \
+            --platform a2a3sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
+            --enable-dep-gen --clone-protocol https
+
+      - name: l2_swimlane smoke
+        run: |
+          pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/l2_swimlane/test_l2_swimlane.py \
+            --platform a2a3sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
+            --enable-l2-swimlane --clone-protocol https
+
+      - name: PMU smoke
+        run: |
+          pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/pmu/test_pmu.py \
+            --platform a2a3sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
+            --enable-pmu 2 --clone-protocol https
+
+      - name: tensor_dump smoke
+        run: |
+          pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/tensor_dump/test_tensor_dump.py \
+            --platform a2a3sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
+            --dump-tensor --clone-protocol https
 
   st-sim-a5:
     needs: detect-changes
@@ -239,9 +273,15 @@ jobs:
             sudo apt-get install -y ninja-build
             sudo apt-get install -y g++-15 || sudo apt-get install -y g++
             if ! command -v g++-15; then sudo ln -s $(which g++) /usr/local/bin/g++-15; fi
+            # graphviz: required by the dep_gen smoke (deps_to_graph -> dot).
+            # Installed unconditionally so both a2a3 and a5 sim jobs stay
+            # uniform — the dep_gen test is a2a3-only today but the cost is
+            # negligible and the alternative branch sprawls the install logic.
+            sudo apt-get install -y graphviz
           else
             brew install ninja
             brew install gcc@15 || brew install gcc
+            brew install graphviz
           fi
 
       - name: Set up Python ${{ matrix.python-version }}
@@ -265,15 +305,147 @@ jobs:
       - name: Run pytest scene tests (a5sim)
         run: |
           set +e
-          pytest examples tests/st --platform a5sim --device 0-15 -v --pto-session-timeout 600 --clone-protocol https
+          pytest examples tests/st --platform a5sim --device 0-15 -v --pto-session-timeout 600 --clone-protocol https --require-pto-isa
           rc=$?
           if [ $rc -ne 0 ]; then
             echo "pytest failed with rc=$rc; retrying with pinned PTO-ISA commit"
             pytest examples tests/st --platform a5sim --device 0-15 -v \
-              --pto-session-timeout 600 --pto-isa-commit ${{ env.PTO_ISA_COMMIT }} --clone-protocol https
+              --pto-session-timeout 600 --pto-isa-commit ${{ env.PTO_ISA_COMMIT }} --clone-protocol https --require-pto-isa
             rc=$?
           fi
           exit $rc
+
+  # ---------- Profiling sub-flags smoke (compile + run) ----------
+  # PTO2_PROFILING / PTO2_ORCH_PROFILING / PTO2_SCHED_PROFILING /
+  # PTO2_TENSORMAP_PROFILING are compile-time gates in src/{a2a3,a5}/runtime/
+  # tensormap_and_ringbuffer/runtime/pto_runtime2_types.h. The defaults
+  # (PTO2_PROFILING=1, sub-flags=0) are exercised by every CI job, but the
+  # non-default branches are dead coverage today — a developer flipping any
+  # of them for perf debugging or to minimize logging overhead had no gate
+  # protecting the gated code from drift (renamed fields, changed signatures,
+  # format-string mismatches in LOG_INFO summaries, dead parameters caught
+  # only by -Wunused-parameter -Werror).
+  #
+  # All combos run sequentially in a single job (not a matrix) so the
+  # apt/python/pip setup cost is paid once, not 12×. Failures across combos
+  # are accumulated and reported together at the end — first failure does
+  # not abort the rest.
+  #
+  # Combos walk the macro hierarchy explicitly (not just "all on" or "all
+  # off") so log scrubbing the failing leg pinpoints the specific gate:
+  #
+  #   PTO2_PROFILING (default=1, covered by every other CI job)
+  #   ├── pto2-off:         -DPTO2_PROFILING=0   (no profiling at all)
+  #   ├── orch:             -DPTO2_ORCH_PROFILING=1
+  #   │   └── orch-tensormap:  + -DPTO2_TENSORMAP_PROFILING=1
+  #   ├── sched:            -DPTO2_SCHED_PROFILING=1
+  #   ├── orch-sched:       ORCH=1 + SCHED=1   (both sub-flags on, tensormap off)
+  #   └── all-on:           ORCH=1 + SCHED=1 + TENSORMAP=1
+  #
+  # Each combo rebuilds the sim runtime with its CXXFLAGS and runs the
+  # smallest full-pipeline example (vector_example) — exercises orchestrator,
+  # scheduler, AICore dispatch, and completion paths gated by the macros.
+  #
+  # Verified locally that each combo's compile_commands.json contains *only*
+  # its declared -D flags, the resulting libaicpu_kernel.so contains *only*
+  # the matching profiling log strings, and pytest output emits *only* the
+  # corresponding profiling block — no cross-contamination from cmake cache.
+  profiling-flags-smoke:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.a2a3_changed == 'true' || needs.detect-changes.outputs.a5_changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up C++ compiler
+        run: |
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+          sudo apt-get install -y g++-15 || sudo apt-get install -y g++
+          if ! command -v g++-15; then sudo ln -s "$(which g++)" /usr/local/bin/g++-15; fi
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+
+      - name: Cache pip packages
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/*.py') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies (editable so simpler_setup always resolves to source tree)
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          # Editable install (`-e .`) avoids a cwd-dependent footgun: with a
+          # plain wheel install, `import simpler_setup` from a non-source-tree
+          # cwd resolves to the wheel-internal copy (PROJECT_ROOT = _assets/),
+          # silently reading runtime .so files from the wheel instead of the
+          # build/lib/ that our combo loop overwrites. With editable mode the
+          # shim always redirects to source-tree paths, regardless of cwd.
+          # pyproject.toml sets editable.rebuild=false so import-time auto
+          # rebuilds cannot clobber our profiling-on binaries.
+          #
+          # Build isolation (pip default, no --no-build-isolation) pulls
+          # scikit-build-core into a throwaway env automatically — matches the
+          # `pre-commit` job's `pip install .` pattern and works on a fresh
+          # CI runner that has no build deps pre-installed.
+          pip install -e '.[test]'
+
+      - name: Run all profiling flag combos × 2 arches
+        run: |
+          # Combo names paired with their CXX defines. Parallel arrays (not
+          # an associative array) so the loop iteration order is deterministic
+          # and the log reads top-to-bottom in hierarchy order.
+          COMBO_NAMES=(pto2-off orch orch-tensormap sched orch-sched all-on)
+          COMBO_DEFS=(
+            "-DPTO2_PROFILING=0"
+            "-DPTO2_ORCH_PROFILING=1"
+            "-DPTO2_ORCH_PROFILING=1 -DPTO2_TENSORMAP_PROFILING=1"
+            "-DPTO2_SCHED_PROFILING=1"
+            "-DPTO2_ORCH_PROFILING=1 -DPTO2_SCHED_PROFILING=1"
+            "-DPTO2_ORCH_PROFILING=1 -DPTO2_SCHED_PROFILING=1 -DPTO2_TENSORMAP_PROFILING=1"
+          )
+          ARCHES=(a2a3sim a5sim)
+          FAIL=()
+
+          for ARCH in "${ARCHES[@]}"; do
+            ARCH_DIR=${ARCH%sim}
+            for i in "${!COMBO_NAMES[@]}"; do
+              NAME=${COMBO_NAMES[$i]}
+              DEFS=${COMBO_DEFS[$i]}
+              echo "::group::$ARCH / $NAME — CXX defines: $DEFS"
+              if ! CXX="g++ $DEFS" python simpler_setup/build_runtimes.py --platforms "$ARCH"; then
+                echo "::error::Build failed: $ARCH / $NAME"
+                FAIL+=("$ARCH/$NAME (build)")
+                echo "::endgroup::"
+                continue
+              fi
+              if ! python -m pytest \
+                   "examples/${ARCH_DIR}/tensormap_and_ringbuffer/vector_example/test_vector_example.py" \
+                   --platform "$ARCH" --device 0-1 -p no:xdist \
+                   --pto-session-timeout 600 --clone-protocol https; then
+                echo "::error::Smoke failed: $ARCH / $NAME"
+                FAIL+=("$ARCH/$NAME (pytest)")
+              fi
+              echo "::endgroup::"
+            done
+          done
+
+          echo ""
+          echo "==== SUMMARY ===="
+          if [ ${#FAIL[@]} -gt 0 ]; then
+            printf 'FAILED: %s\n' "${FAIL[@]}"
+            exit 1
+          fi
+          echo "All $((${#COMBO_NAMES[@]} * ${#ARCHES[@]})) combos passed."
 
   # ---------- Unit tests (a2a3 hardware, Python + C++) ----------
   ut-a2a3:
@@ -299,6 +471,10 @@ jobs:
       - name: Build and run C++ hardware unit tests
         run: |
           source .venv/bin/activate
+          # pip install's build_runtimes.py already cloned pto-isa into
+          # build/pto-isa; point this step's RuntimeBuilder at it so
+          # _init_a2a3's PTO_ISA_ROOT check passes without re-cloning.
+          export PTO_ISA_ROOT="$(pwd)/build/pto-isa"
           python -c "from simpler_setup.runtime_builder import RuntimeBuilder; RuntimeBuilder('a2a3').get_binaries('tensormap_and_ringbuffer', build=True)"
           cmake -B tests/ut/cpp/build -S tests/ut/cpp -DSIMPLER_ENABLE_HARDWARE_TESTS=ON
           cmake --build tests/ut/cpp/build
@@ -331,20 +507,59 @@ jobs:
           source .venv/bin/activate
           pip install --upgrade pip
           pip install '.[test]'
+          # Warn if graphviz isn't installed on the runner — the dep_gen
+          # smoke step needs `dot` to render deps_to_graph. The Python
+          # has_binary("dot") guard in the test will skip cleanly without
+          # it, but coverage drops, so flag it loudly here.
+          if ! command -v dot >/dev/null 2>&1; then
+            echo "::warning::graphviz 'dot' not found on PATH; deps_to_graph tool smoke will skip. Install graphviz on this self-hosted runner to restore coverage."
+          fi
 
       - name: Run pytest scene tests (a2a3)
         run: |
           set +e
           source .venv/bin/activate
-          python -m pytest examples tests/st --platform a2a3 --device ${DEVICE_RANGE} -v --pto-session-timeout 600 --clone-protocol https
+          python -m pytest examples tests/st --platform a2a3 --device ${DEVICE_RANGE} -v --pto-session-timeout 600 --clone-protocol ssh --require-pto-isa
           rc=$?
           if [ $rc -ne 0 ]; then
             echo "pytest failed with rc=$rc; retrying with pinned PTO-ISA commit"
             python -m pytest examples tests/st --platform a2a3 --device ${DEVICE_RANGE} -v \
-              --pto-session-timeout 600 --pto-isa-commit ${{ env.PTO_ISA_COMMIT }} --clone-protocol https
+              --pto-session-timeout 600 --pto-isa-commit ${{ env.PTO_ISA_COMMIT }} --clone-protocol ssh --require-pto-isa
             rc=$?
           fi
           exit $rc
+
+      # DFX per-feature smokes — hardware mirror of the st-sim-a2a3 set. The
+      # race window in dep_gen only fires on real timing, so this row is
+      # what would catch onboard-only regressions like the missing kernel.cpp
+      # propagation #742 fixed.
+      - name: dep_gen smoke
+        run: |
+          source .venv/bin/activate
+          python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py \
+            --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+            --enable-dep-gen --clone-protocol ssh
+
+      - name: l2_swimlane smoke
+        run: |
+          source .venv/bin/activate
+          python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/l2_swimlane/test_l2_swimlane.py \
+            --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+            --enable-l2-swimlane --clone-protocol ssh
+
+      - name: PMU smoke
+        run: |
+          source .venv/bin/activate
+          python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/pmu/test_pmu.py \
+            --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+            --enable-pmu 2 --clone-protocol ssh
+
+      - name: tensor_dump smoke
+        run: |
+          source .venv/bin/activate
+          python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/tensor_dump/test_tensor_dump.py \
+            --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+            --dump-tensor --clone-protocol ssh
 
 
   # ---------- Detect platform-specific changes (runs on GitHub server) ----------
@@ -449,5 +664,5 @@ jobs:
         run: |
           source .venv/bin/activate
           DEVICE_LIST=$(python -c "s,e='${DEVICE_RANGE}'.split('-'); print(','.join(str(i) for i in range(int(s),int(e)+1)))")
-          PYTEST="python -m pytest examples tests/st --platform a5 --device ${DEVICE_RANGE} -v --clone-protocol https"
-          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "set +e; $PYTEST --pto-session-timeout 1200; rc=\$?; if [ \$rc -ne 0 ]; then echo \"pytest failed with rc=\$rc; retrying with pinned PTO-ISA commit\"; $PYTEST --pto-session-timeout 1200 --pto-isa-commit ${{ env.PTO_ISA_COMMIT }} --clone-protocol https; rc=\$?; fi; exit \$rc"
+          PYTEST="python -m pytest examples tests/st --platform a5 --device ${DEVICE_RANGE} -v --clone-protocol ssh --require-pto-isa"
+          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "set +e; $PYTEST --pto-session-timeout 1200; rc=\$?; if [ \$rc -ne 0 ]; then echo \"pytest failed with rc=\$rc; retrying with pinned PTO-ISA commit\"; $PYTEST --pto-session-timeout 1200 --pto-isa-commit ${{ env.PTO_ISA_COMMIT }} --clone-protocol ssh; rc=\$?; fi; exit \$rc"

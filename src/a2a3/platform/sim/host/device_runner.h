@@ -15,7 +15,7 @@
  * It provides a compatible interface with the onboard DeviceRunner for the
  * core operations (allocate, copy, run, finalize, upload/remove kernel).
  * The onboard version exposes additional low-level methods (launch_aicpu_kernel,
- * launch_aicore_kernel, ensure_device_set) for custom workflows.
+ * launch_aicore_kernel, ensure_device_initialized) for custom workflows.
  *
  * Key differences from onboard:
  * - Uses host memory instead of device memory
@@ -39,8 +39,12 @@
 #include <map>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
+#include "callable.h"
+#include "prepare_callable_common.h"
 #include "common/core_type.h"
 #include "common/kernel_args.h"
 #include "common/memory_barrier.h"
@@ -52,18 +56,8 @@
 #include "host/l2_perf_collector.h"
 #include "host/tensor_dump_collector.h"
 #include "host/pmu_collector.h"
+#include "host/dep_gen_collector.h"
 #include "runtime.h"
-
-/**
- * Mapped kernel binary loaded via dlopen
- *
- * Stores dlopen handle and function pointer address. This enables
- * proper handling of external symbols (e.g., std::exp) via PLT/GOT.
- */
-struct MappedKernel {
-    void *dl_handle{nullptr};        // dlopen handle
-    uint8_t *callable_buf{nullptr};  // host-memory copy of CoreCallable (owns memory)
-};
 
 /**
  * Device runner for simulated kernel execution
@@ -136,15 +130,27 @@ public:
      *
      * @param runtime              Runtime to execute
      * @param block_dim            Number of blocks (1 block = 1 AIC + 2 AIV)
-     * @param device_id            Device ID (ignored in simulation)
-     * @param aicpu_so_binary      AICPU binary (ignored in simulation)
-     * @param aicore_kernel_binary AICore binary (ignored in simulation)
      * @param launch_aicpu_num     Number of AICPU threads
      * @return 0 on success
+     *
+     * Bound device id, AICPU/AICore executor binaries, and log filter are
+     * captured once by simpler_init / libsimpler_log.so and read off
+     * DeviceRunner state / HostLogger here — no per-run args.
      */
-    int
-    run(Runtime &runtime, int block_dim, int device_id, const std::vector<uint8_t> &aicpu_so_binary,
-        const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num = 1);
+    int run(Runtime &runtime, int block_dim, int launch_aicpu_num = 1);
+
+    /**
+     * Take ownership of the AICPU + AICore executor binaries. Called once
+     * by simpler_init at ChipWorker::init time; subsequent run() invocations
+     * read from `aicpu_so_binary_` / `aicore_kernel_binary_`.
+     */
+    void set_executors(std::vector<uint8_t> aicpu_so_binary, std::vector<uint8_t> aicore_kernel_binary) {
+        aicpu_so_binary_ = std::move(aicpu_so_binary);
+        aicore_kernel_binary_ = std::move(aicore_kernel_binary);
+    }
+
+    /** The device id captured by simpler_init's attach_current_thread call. */
+    int device_id() const { return device_id_; }
 
     /**
      * Enablement setters for the three diagnostics sub-features. Called by
@@ -158,16 +164,27 @@ public:
         enable_pmu_ = (enable_pmu > 0);
         pmu_event_type_ = resolve_pmu_event_type(enable_pmu);
     }
-    // Severity floor (0=DEBUG..4=NUL) and INFO verbosity threshold (0..9).
-    // Pushed in by the Python layer via run_runtime() and propagated to AICPU
-    // through KernelArgs.
-    void set_log_level(int log_level) { log_level_ = log_level; }
-    void set_log_info_v(int log_info_v) { log_info_v_ = log_info_v; }
+    void set_dep_gen_enabled(bool enable) { enable_dep_gen_ = enable; }
     // Directory under which all diagnostic artifacts (l2_perf_records.json /
     // tensor_dump/ / pmu.csv) land. Required (non-empty) when any diagnostic
     // is enabled; CallConfig::validate() enforces this contract upstream.
     void set_output_prefix(const char *prefix) { output_prefix_ = (prefix != nullptr) ? prefix : ""; }
     const std::string &output_prefix() const { return output_prefix_; }
+
+    /**
+     * Attach the calling thread to the simulated device.
+     *
+     * Mirrors the onboard contract: binds the caller's TLS to `device_id`
+     * (so sim hooks routing through `pto_cpu_sim_get_bound_device()` see the
+     * right context) and idempotently acquires the process-wide sim device
+     * registry entry. Called from `simpler_init` and re-invoked at the top
+     * of every device-op so any caller thread becomes the bound thread for
+     * the op without requiring an explicit pre-attach step.
+     *
+     * @param device_id Device ID (>= 0).
+     * @return 0 on success, negative on invalid id / device-id mismatch.
+     */
+    int attach_current_thread(int device_id);
 
     /**
      * Print handshake results
@@ -184,38 +201,52 @@ public:
     int finalize();
 
     /**
-     * Upload a kernel binary and return the function address
+     * Upload an entire ChipCallable buffer (sim path).
      *
-     * Loads the complete kernel .so via dlopen, enabling proper handling
-     * of external symbols (e.g., std::exp, std::log) via PLT/GOT.
-     * Uses dlsym to resolve the unified entry point "kernel_entry".
+     * Copies the ChipCallable buffer into an internal host scratch (host /
+     * device memory is unified in sim), dlopens each child binary as a temp
+     * .so to obtain its function pointer, and writes that pointer into the
+     * child's resolved_addr_ field. Returns the host address of the scratch
+     * (= chip_dev) so callers can compute child addresses as
+     *     chip_dev + offsetof(ChipCallable, storage_) + child_offset(i)
+     * and store them via runtime->set_function_bin_addr(fid, child_dev).
      *
-     * If the kernel is already uploaded (same func_id), returns the
-     * cached address without re-uploading.
-     *
-     * @param func_id      Function identifier (for caching)
-     * @param bin_data     Complete kernel .so binary data
-     * @param bin_size     Size of binary data in bytes
-     * @return Function pointer address on success, 0 on error
+     * Pool-managed by content hash (FNV-1a 64-bit); identical bytes return
+     * the cached buffer. All chip buffers + their dlopen handles are bulk-
+     * freed in finalize(). Returns 0 on failure or when child_count() == 0.
      */
-    uint64_t upload_kernel_binary(int func_id, const uint8_t *bin_data, size_t bin_size);
+    uint64_t upload_chip_callable_buffer(const ChipCallable *callable);
 
-    /**
-     * Remove a kernel binary from memory
-     *
-     * Closes the dlopen handle and removes the cached entry.
-     * This should be called during per-case cleanup.
-     *
-     * @param func_id   Function identifier to remove
-     */
-    void remove_kernel_binary(int func_id);
+    int register_prepared_callable(
+        int32_t callable_id, const void *orch_so_data, size_t orch_so_size, const char *func_name,
+        const char *config_name, std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
+    );
+    // Host-orchestration sibling of register_prepared_callable; see
+    // src/a2a3/platform/onboard/host/device_runner.h for the contract. Sim
+    // shares the host-only dlopen path verbatim (no AICPU side effects).
+    int register_prepared_callable_host_orch(
+        int32_t callable_id, void *host_dlopen_handle, void *host_orch_func_ptr,
+        std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
+    );
+    int unregister_prepared_callable(int32_t callable_id);
+    bool has_prepared_callable(int32_t callable_id) const;
+    BindPreparedCallableResult bind_prepared_callable_to_runtime(Runtime &runtime, int32_t callable_id);
+    size_t aicpu_dlopen_count() const { return aicpu_dlopen_total_; }
+    size_t host_dlopen_count() const { return host_dlopen_total_; }
 
 private:
-    // Configuration
+    // Configuration. device_id_ is set once in attach_current_thread() during
+    // simpler_init and read by run() / create_thread() afterward — single-
+    // threaded with respect to the user's call sequence, so plain int is
+    // sufficient.
     int device_id_{-1};
     int block_dim_{0};
     int cores_per_blockdim_{PLATFORM_CORES_PER_BLOCKDIM};
     int worker_count_{0};
+    // Executor binaries — populated once via set_executors() during
+    // simpler_init, owned by this runner for the rest of its lifetime.
+    std::vector<uint8_t> aicpu_so_binary_;
+    std::vector<uint8_t> aicore_kernel_binary_;
 
     // Memory management
     MemoryAllocator mem_alloc_;
@@ -223,15 +254,44 @@ private:
     // Simulation state (no actual device resources)
     KernelArgs kernel_args_;
 
-    // Kernel binary mapping (func_id -> executable memory)
-    std::map<int, MappedKernel> func_id_to_addr_;
+    // Chip-callable buffer pool (sim path). Keyed by FNV-1a 64-bit content
+    // hash of the ChipCallable bytes. Each entry owns a host scratch holding
+    // the ChipCallable with each child's resolved_addr_ fixed up to the
+    // dlopen'd function pointer; chip_dev == (uint64_t)host_scratch. The
+    // dlopen handles in `dlopen_handles` are bulk-dlclose'd in finalize().
+    struct ChipCallableBuffer {
+        uint64_t chip_dev{0};  // (uint64_t)host_scratch
+        uint8_t *host_scratch{nullptr};
+        size_t total_size{0};
+        std::vector<void *> dlopen_handles;
+    };
+    std::unordered_map<uint64_t, ChipCallableBuffer> chip_callable_buffers_;
 
-    // Orchestration SO cache (host-resident in sim; see onboard for shape).
-    uint64_t cached_orch_so_hash_{0};
-    void *dev_orch_so_buffer_{nullptr};
-    size_t dev_orch_so_capacity_{0};
-    std::vector<uint8_t> host_orch_so_copy_;
-
+    // Per-callable_id prepared state. Mirrors onboard.
+    struct PreparedCallableState {
+        // trb path
+        uint64_t hash{0};
+        uint64_t dev_orch_so_addr{0};
+        size_t dev_orch_so_size{0};
+        std::string func_name;
+        std::string config_name;
+        // common
+        std::vector<std::pair<int, uint64_t>> kernel_addrs;
+        std::vector<ArgDirection> signature;
+        // hbg path
+        void *host_dlopen_handle{nullptr};
+        void *host_orch_func_ptr{nullptr};
+    };
+    struct OrchSoBuffer {
+        void *dev_addr{nullptr};
+        size_t capacity{0};
+        int refcount{0};
+    };
+    std::unordered_map<int32_t, PreparedCallableState> prepared_callables_;
+    std::unordered_map<uint64_t, OrchSoBuffer> orch_so_dedup_;
+    std::unordered_set<int32_t> aicpu_seen_callable_ids_;
+    size_t aicpu_dlopen_total_{0};
+    size_t host_dlopen_total_{0};
     // AICPU executor SO: load-once, matching onboard's binaries_loaded_ pattern.
     // The aicpu_executor g_aicpu_executor static lives inside the dlopen'd DSO;
     // reloading it destroys orch_so_handle_ and breaks the orch-SO cache-hit path.
@@ -244,7 +304,7 @@ private:
     void *aicpu_so_handle_{nullptr};
     void *aicore_so_handle_{nullptr};
     int (*aicpu_execute_func_)(Runtime *){nullptr};
-    void (*aicore_execute_func_)(Runtime *, int, CoreType, uint32_t, uint64_t){nullptr};
+    void (*aicore_execute_func_)(Runtime *, int, CoreType, uint32_t, uint64_t, uint32_t, uint64_t){nullptr};
     void (*set_platform_regs_func_)(uint64_t){nullptr};
     void (*set_platform_dump_base_func_)(uint64_t){nullptr};
     void (*set_dump_tensor_enabled_func_)(bool){nullptr};
@@ -253,8 +313,8 @@ private:
     void (*set_platform_pmu_base_func_)(uint64_t){nullptr};
     void (*set_platform_pmu_reg_addrs_func_)(uint64_t){nullptr};
     void (*set_pmu_enabled_func_)(bool){nullptr};
-    void (*set_log_level_func_)(int){nullptr};
-    void (*set_log_info_v_func_)(int){nullptr};
+    void (*set_platform_dep_gen_base_func_)(uint64_t){nullptr};
+    void (*set_dep_gen_enabled_func_)(bool){nullptr};
     std::string aicpu_so_path_;
     std::string aicore_so_path_;
 
@@ -264,23 +324,21 @@ private:
     // Tensor dump (independent shared memory + memory manager)
     TensorDumpCollector dump_collector_;
     // PMU collector (independent of profiling pipeline)
-    PmuCollectorHost pmu_collector_;
+    PmuCollector pmu_collector_;
+    // dep_gen collector — captures orchestrator submit_task inputs for offline replay
+    DepGenCollector dep_gen_collector_;
 
-    // Private helper methods
-    int ensure_device_initialized(
-        int device_id, const std::vector<uint8_t> &aicpu_so_binary, const std::vector<uint8_t> &aicore_kernel_binary
-    );
-    int ensure_binaries_loaded(
-        const std::vector<uint8_t> &aicpu_so_binary, const std::vector<uint8_t> &aicore_kernel_binary
-    );
+    // Private helper methods — read aicpu_so_binary_ / aicore_kernel_binary_
+    // off the runner (populated by set_executors during simpler_init).
+    int ensure_device_initialized();
+    int ensure_binaries_loaded();
     void unload_executor_binaries();
 
     /**
-     * Stage the orchestration SO bytes into a host-resident buffer that
-     * `aicpu_executor` can dlopen. Identical contract to the onboard
-     * version: `runtime.pending_orch_so_data_/size_` are consumed and
-     * `runtime.{dev_orch_so_addr_, dev_orch_so_size_, has_new_orch_so_}`
-     * are populated with the cache-aware result.
+     * Stamp `runtime.{dev_orch_so_addr_, dev_orch_so_size_}` from the
+     * PreparedCallableState for `runtime.get_active_callable_id()`. Identical
+     * contract to the onboard version: bytes were staged at
+     * `register_prepared_callable` time, so this is metadata-only — no copy.
      */
     int prepare_orch_so(Runtime &runtime);
 
@@ -294,13 +352,23 @@ private:
      * @param device_id Device ID (ignored in simulation)
      * @return 0 on success, error code on failure
      */
-    int init_l2_perf_collection(int num_aicore, int device_id);
+    int init_l2_perf(int num_aicore, int device_id);
 
-    int init_tensor_dump(Runtime &runtime, int num_aicore, int device_id);
+    int init_tensor_dump(Runtime &runtime, int device_id);
 
-    int init_pmu_buffers(
-        int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id
-    );
+    int init_pmu(int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id);
+
+    int init_dep_gen(int num_threads, int device_id);
+
+    /**
+     * Finalize whichever diagnostics collectors are currently initialized,
+     * releasing their shared memory back to mem_alloc_. Idempotent: each
+     * collector's finalize() early-outs once its shm has been released.
+     * Invoked at the end of every run() so a Worker reused across runs starts
+     * each run with the collectors re-initializable, and from finalize() as a
+     * backstop before mem_alloc_.finalize().
+     */
+    void finalize_collectors();
     // Enablement for the three diagnostics sub-features. Written by the c_api
     // entry point via set_enable_*() before run(), read inside run() and its
     // helpers. Moved off Runtime / run() args so all three sub-features use
@@ -308,10 +376,9 @@ private:
     bool enable_l2_swimlane_{false};
     bool enable_dump_tensor_{false};
     bool enable_pmu_{false};
+    bool enable_dep_gen_{false};
     PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};  // resolved from set_pmu_enabled()
     std::string output_prefix_{};                                  // diagnostic artifact root directory
-    int log_level_{1};                                             // 0=DEBUG..4=NUL; default INFO
-    int log_info_v_{5};                                            // INFO verbosity threshold; default V5
 };
 
 #endif  // SRC_A2A3_PLATFORM_SIM_HOST_DEVICE_RUNNER_H_

@@ -18,11 +18,11 @@ partial_local is a per-rank torch.share_memory_() tensor; it is the OUTPUT of
 stage 1 and the INPUT of stage 2.  Because both submits see the same
 ``buffer.addr``, the framework's TensorMap discovers the producer/consumer
 edge automatically — no manual barriers in Python.  Cross-rank exchange in
-stage 2 still goes through a per-chip ``scratch`` HCCL-window buffer (laid
+stage 2 still goes through a per-chip communication-window ``scratch`` buffer (laid
 out as ``[mailbox: nranks * M*N floats | signal tail: nranks int32 slots]``).
 
-Hardware only.  Run:
-    python examples/workers/l3/ffn_tp_parallel/main.py -d 0-1
+Run:
+    python examples/workers/l3/ffn_tp_parallel/main.py -p a2a3sim -d 0-1
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ import sys
 
 # Workaround for the duplicate-libomp abort when homebrew numpy and pip torch
 # coexist in one macOS process. Harmless on Linux. Must be set before
-# ``import torch``. See docs/macos-libomp-collision.md.
+# ``import torch``. See docs/troubleshooting/macos-libomp-collision.md.
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import torch  # noqa: E402
@@ -79,10 +79,10 @@ def parse_device_range(spec: str) -> list[int]:
     return ids
 
 
-def _kernel_compiler(platform: str) -> tuple[KernelCompiler, str, list[str], list[str]]:
+def _kernel_compiler(platform: str, pto_isa_commit: str | None) -> tuple[KernelCompiler, str, list[str], list[str]]:
     kc = KernelCompiler(platform=platform)
     runtime = "tensormap_and_ringbuffer"
-    pto_isa_root = ensure_pto_isa_root(clone_protocol="https")
+    pto_isa_root = ensure_pto_isa_root(commit=pto_isa_commit, clone_protocol="https")
     include_dirs = kc.get_orchestration_include_dirs(runtime)
     # The allreduce_sum kernel resolves CommContext from
     # "platform_comm/comm_context.h" under src/common/.
@@ -90,9 +90,9 @@ def _kernel_compiler(platform: str) -> tuple[KernelCompiler, str, list[str], lis
     return kc, pto_isa_root, list(include_dirs), kernel_include_dirs
 
 
-def build_ffn_local_callable(platform: str) -> ChipCallable:
+def build_ffn_local_callable(platform: str, pto_isa_commit: str | None) -> ChipCallable:
     """AIC matmul: x_shard @ w_shard -> partial_local."""
-    kc, pto_isa_root, _, kernel_include_dirs = _kernel_compiler(platform)
+    kc, pto_isa_root, _, kernel_include_dirs = _kernel_compiler(platform, pto_isa_commit)
     runtime = "tensormap_and_ringbuffer"
 
     kernel_bytes = kc.compile_incore(
@@ -101,7 +101,8 @@ def build_ffn_local_callable(platform: str) -> ChipCallable:
         pto_isa_root=pto_isa_root,
         extra_include_dirs=kernel_include_dirs,
     )
-    kernel_bytes = extract_text_section(kernel_bytes)
+    if not platform.endswith("sim"):
+        kernel_bytes = extract_text_section(kernel_bytes)
 
     orch_bytes = kc.compile_orchestration(
         runtime_name=runtime,
@@ -114,14 +115,15 @@ def build_ffn_local_callable(platform: str) -> ChipCallable:
     return ChipCallable.build(
         signature=[ArgDirection.IN, ArgDirection.IN, ArgDirection.OUT],
         func_name="ffn_local_orchestration",
+        config_name="ffn_local_orchestration_config",
         binary=orch_bytes,
         children=[(0, core_callable)],
     )
 
 
-def build_allreduce_sum_callable(platform: str) -> ChipCallable:
+def build_allreduce_sum_callable(platform: str, pto_isa_commit: str | None) -> ChipCallable:
     """AIV cross-rank sum (4-phase publish/notify/wait/accumulate)."""
-    kc, pto_isa_root, _, kernel_include_dirs = _kernel_compiler(platform)
+    kc, pto_isa_root, _, kernel_include_dirs = _kernel_compiler(platform, pto_isa_commit)
     runtime = "tensormap_and_ringbuffer"
 
     kernel_bytes = kc.compile_incore(
@@ -130,7 +132,8 @@ def build_allreduce_sum_callable(platform: str) -> ChipCallable:
         pto_isa_root=pto_isa_root,
         extra_include_dirs=kernel_include_dirs,
     )
-    kernel_bytes = extract_text_section(kernel_bytes)
+    if not platform.endswith("sim"):
+        kernel_bytes = extract_text_section(kernel_bytes)
 
     orch_bytes = kc.compile_orchestration(
         runtime_name=runtime,
@@ -143,6 +146,7 @@ def build_allreduce_sum_callable(platform: str) -> ChipCallable:
     return ChipCallable.build(
         signature=[ArgDirection.IN, ArgDirection.OUT, ArgDirection.INOUT],
         func_name="allreduce_sum_orchestration",
+        config_name="allreduce_sum_orchestration_config",
         binary=orch_bytes,
         children=[(1, core_callable)],
     )
@@ -155,7 +159,12 @@ def make_rank_inputs(rank: int) -> tuple[torch.Tensor, torch.Tensor]:
     return x, w
 
 
-def run(device_ids: list[int]) -> int:
+def run(
+    device_ids: list[int],
+    platform: str = "a2a3",
+    pto_isa_commit: str | None = None,
+    build: bool = False,
+) -> int:
     nranks = len(device_ids)
     # scratch = mailbox(nranks * M*N floats) + signal tail (nranks int32).
     scratch_count = nranks * M * N
@@ -168,7 +177,7 @@ def run(device_ids: list[int]) -> int:
     except FileNotFoundError:
         pass
 
-    print(f"[ffn_tp_parallel] devices={device_ids} nranks={nranks} M={M} K={K} N={N}")
+    print(f"[ffn_tp_parallel] platform={platform} devices={device_ids} nranks={nranks} M={M} K={K} N={N}")
 
     # Per-rank host tensors via torch.share_memory_(): inputs, partial_local
     # (stage1 output / stage2 input), and final y (stage2 output).
@@ -198,20 +207,23 @@ def run(device_ids: list[int]) -> int:
     ]
 
     print("[ffn_tp_parallel] compiling kernels...")
-    ffn_local_cc = build_ffn_local_callable("a2a3")
-    allreduce_cc = build_allreduce_sum_callable("a2a3")
+    ffn_local_cc = build_ffn_local_callable(platform, pto_isa_commit)
+    allreduce_cc = build_allreduce_sum_callable(platform, pto_isa_commit)
 
     worker = Worker(
         level=3,
-        platform="a2a3",
+        platform=platform,
         runtime="tensormap_and_ringbuffer",
         device_ids=device_ids,
         num_sub_workers=0,
         chip_bootstrap_configs=cfgs,
+        build=build,
     )
+    ffn_cid = worker.register(ffn_local_cc)
+    allreduce_cid = worker.register(allreduce_cc)
 
     try:
-        print("[ffn_tp_parallel] init worker (forks chip children + bootstraps HCCL)...")
+        print("[ffn_tp_parallel] init worker (forks chip children + bootstraps comm backend)...")
         worker.init()
 
         contexts: list[ChipContext] = worker.chip_contexts
@@ -231,7 +243,7 @@ def run(device_ids: list[int]) -> int:
                 a1.add_tensor(make_tensor_arg(host_x_shards[i]), TensorArgType.INPUT)
                 a1.add_tensor(make_tensor_arg(host_w_shards[i]), TensorArgType.INPUT)
                 a1.add_tensor(make_tensor_arg(host_partial[i]), TensorArgType.OUTPUT_EXISTING)
-                orch.submit_next_level(ffn_local_cc, a1, cfg, worker=i)
+                orch.submit_next_level(ffn_cid, a1, cfg, worker=i)
 
                 # Stage 2: AIV cross-rank sum. Tagging partial_local INPUT
                 # with the same buffer.addr makes TensorMap auto-link this
@@ -250,7 +262,7 @@ def run(device_ids: list[int]) -> int:
                 )
                 a2.add_scalar(ctx.nranks)
                 a2.add_scalar(ctx.device_ctx)
-                orch.submit_next_level(allreduce_cc, a2, cfg, worker=i)
+                orch.submit_next_level(allreduce_cid, a2, cfg, worker=i)
 
         print("[ffn_tp_parallel] running 2-chip 2-stage DAG...")
         worker.run(orch_fn, args=None, config=CallConfig())
@@ -292,9 +304,16 @@ def run(device_ids: list[int]) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("-p", "--platform", default="a2a3", help="Platform backend, e.g. a2a3 or a2a3sim.")
     parser.add_argument("-d", "--device", default="0-1", help="Device range, e.g. '0-1'. Two chips required.")
+    parser.add_argument(
+        "--build", action="store_true", help="Rebuild runtime from source instead of using cached libs."
+    )
+    parser.add_argument("--pto-isa-commit", default=None, help="Optional PTO ISA commit/tag to fetch before compiling.")
     cli = parser.parse_args()
-    return run(parse_device_range(cli.device))
+    return run(
+        parse_device_range(cli.device), platform=cli.platform, pto_isa_commit=cli.pto_isa_commit, build=cli.build
+    )
 
 
 if __name__ == "__main__":

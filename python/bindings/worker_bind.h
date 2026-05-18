@@ -15,16 +15,15 @@
  * Compiled into the same _task_interface extension module as task_interface.cpp.
  * Call bind_worker(m) from the NB_MODULE definition in task_interface.cpp.
  *
- * PR-D-2: `ChipProcess` and `SubWorker` bindings are removed; their
- * PROCESS-mode dispatch logic now lives inside `WorkerThread`. Python callers
- * register PROCESS-mode workers via `add_next_level_process(mailbox_ptr)` /
- * `add_sub_process(mailbox_ptr)` instead of wrapping an IWorker subclass.
+ * Python callers register sub-workers via `add_next_level_worker(mailbox_ptr)`
+ * / `add_sub_worker(mailbox_ptr)`. Each mailbox addresses a MAILBOX_SIZE-byte
+ * MAP_SHARED region; the real IWorker lives in a forked Python child consuming
+ * the mailbox via `_chip_process_loop` / `_sub_worker_loop`.
  */
 
 #pragma once
 
 #include <nanobind/nanobind.h>
-#include <nanobind/stl/function.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
@@ -32,7 +31,6 @@
 #include <stdexcept>
 
 #include "chip_bootstrap_channel.h"
-#include "chip_worker.h"
 #include "ring.h"
 #include "orchestrator.h"
 #include "types.h"
@@ -100,20 +98,22 @@ inline void bind_worker(nb::module_ &m) {
     nb::class_<Orchestrator>(m, "_Orchestrator")
         .def(
             "submit_next_level",
-            [](Orchestrator &self, uint64_t callable, const TaskArgs &args, const CallConfig &config, int8_t worker) {
-                return self.submit_next_level(callable, args, config, worker);
+            [](Orchestrator &self, int32_t callable_id, const TaskArgs &args, const CallConfig &config, int8_t worker) {
+                return self.submit_next_level(callable_id, args, config, worker);
             },
-            nb::arg("callable"), nb::arg("args"), nb::arg("config"), nb::arg("worker") = int8_t(-1),
-            "Submit a NEXT_LEVEL (chip) task. worker= pins to a specific next-level worker (-1 = any)."
+            nb::arg("callable_id"), nb::arg("args"), nb::arg("config"), nb::arg("worker") = int8_t(-1),
+            "Submit a NEXT_LEVEL (chip) task by registered callable id. "
+            "worker= pins to a specific next-level worker (-1 = any)."
         )
         .def(
             "submit_next_level_group",
-            [](Orchestrator &self, uint64_t callable, const std::vector<TaskArgs> &args_list, const CallConfig &config,
-               const std::vector<int8_t> &workers) {
-                return self.submit_next_level_group(callable, args_list, config, workers);
+            [](Orchestrator &self, int32_t callable_id, const std::vector<TaskArgs> &args_list,
+               const CallConfig &config, const std::vector<int8_t> &workers) {
+                return self.submit_next_level_group(callable_id, args_list, config, workers);
             },
-            nb::arg("callable"), nb::arg("args_list"), nb::arg("config"), nb::arg("workers") = std::vector<int8_t>{},
-            "Submit a group of NEXT_LEVEL tasks. workers= per-args affinity (empty = any)."
+            nb::arg("callable_id"), nb::arg("args_list"), nb::arg("config"), nb::arg("workers") = std::vector<int8_t>{},
+            "Submit a group of NEXT_LEVEL tasks by registered callable id. "
+            "workers= per-args affinity (empty = any)."
         )
         .def(
             "submit_sub",
@@ -194,77 +194,57 @@ inline void bind_worker(nb::module_ &m) {
             "(default 1 GiB; total VA = 4 × heap_ring_size)."
         )
 
-        // THREAD-mode registration (parent calls worker->run directly).
         .def(
             "add_next_level_worker",
-            [](Worker &self, Worker &w) {
-                self.add_worker(WorkerType::NEXT_LEVEL, &w);
-            },
-            nb::arg("worker"), "Add a lower-level Worker as a NEXT_LEVEL sub-worker (THREAD mode)."
-        )
-        .def(
-            "add_next_level_worker",
-            [](Worker &self, ChipWorker &w) {
-                self.add_worker(WorkerType::NEXT_LEVEL, &w);
-            },
-            nb::arg("worker"), "Add a ChipWorker as a NEXT_LEVEL sub-worker (THREAD mode)."
-        )
-
-        // PROCESS-mode registration (parent writes unified mailbox; child runs
-        // the real IWorker in its own address space).
-        .def(
-            "add_next_level_process",
             [](Worker &self, uint64_t mailbox_ptr) {
-                self.add_process_worker(WorkerType::NEXT_LEVEL, reinterpret_cast<void *>(mailbox_ptr));
+                self.add_worker(WorkerType::NEXT_LEVEL, reinterpret_cast<void *>(mailbox_ptr));
             },
             nb::arg("mailbox_ptr"),
-            "Add a PROCESS-mode NEXT_LEVEL worker. `mailbox_ptr` is the address of a "
-            "MAILBOX_SIZE-byte MAP_SHARED region. The child process loop is "
+            "Add a NEXT_LEVEL sub-worker. `mailbox_ptr` is the address of a "
+            "MAILBOX_SIZE-byte MAP_SHARED region; the child process loop is "
             "Python-managed (fork + _chip_process_loop)."
         )
         .def(
-            "add_sub_process",
+            "add_sub_worker",
             [](Worker &self, uint64_t mailbox_ptr) {
-                self.add_process_worker(WorkerType::SUB, reinterpret_cast<void *>(mailbox_ptr));
+                self.add_worker(WorkerType::SUB, reinterpret_cast<void *>(mailbox_ptr));
             },
             nb::arg("mailbox_ptr"),
-            "Add a PROCESS-mode SUB worker. `mailbox_ptr` is the address of a "
-            "MAILBOX_SIZE-byte MAP_SHARED region. The child process loop is "
+            "Add a SUB sub-worker. `mailbox_ptr` is the address of a "
+            "MAILBOX_SIZE-byte MAP_SHARED region; the child process loop is "
             "Python-managed (fork + _sub_worker_loop)."
         )
 
         .def("init", &Worker::init, "Start the Scheduler thread.")
         .def("close", &Worker::close, "Stop the Scheduler thread.")
 
-        // THREAD-mode callback for L4+ recursion (approach b: Python callback).
-        // The lambda captures the Python callable and wraps it with GIL
-        // acquisition + TaskArgsView→TaskArgs reconstruction so the Python
-        // side receives normal objects.
-        .def(
-            "set_run_callback",
-            [](Worker &self, nb::object cb) {
-                self.set_run_callback(
-                    [cb_stored = nb::object(cb)](uint64_t callable, TaskArgsView view, const CallConfig &config) {
-                        nb::gil_scoped_acquire gil;
-                        TaskArgs args;
-                        for (int32_t i = 0; i < view.tensor_count; i++) {
-                            args.add_tensor(view.tensors[i]);
-                        }
-                        for (int32_t i = 0; i < view.scalar_count; i++) {
-                            args.add_scalar(view.scalars[i]);
-                        }
-                        cb_stored(callable, &args, &config);
-                    }
-                );
-            },
-            nb::arg("callback"),
-            "Set the Python callback for THREAD-mode L4+ dispatch. The callback "
-            "receives (callable_id, TaskArgs, CallConfig) with the GIL held."
-        )
-
         .def(
             "get_orchestrator", &Worker::get_orchestrator, nb::rv_policy::reference_internal,
             "Return the Orchestrator handle (lifetime tied to this Worker)."
+        )
+
+        // --- Mailbox control plane (parent side) ---
+        // These hold the per-WorkerThread mailbox_mu_ inside C++, so they
+        // serialize against dispatch_process without any Python-side lock.
+        // Release the GIL during the spin-poll wait so other Python threads
+        // (e.g. a concurrent Worker.run) can keep running.
+        .def(
+            "control_prepare", &Worker::control_prepare, nb::arg("worker_id"), nb::arg("cid"),
+            nb::call_guard<nb::gil_scoped_release>(),
+            "Prewarm a NEXT_LEVEL child for `cid` by sending CTRL_PREPARE. "
+            "Blocks until the child publishes CONTROL_DONE."
+        )
+        .def(
+            "broadcast_register_all", &Worker::broadcast_register_all, nb::arg("cid"), nb::arg("blob_ptr"),
+            nb::arg("blob_size"), nb::call_guard<nb::gil_scoped_release>(),
+            "Stage `blob_size` bytes from `blob_ptr` into a POSIX shm and broadcast "
+            "CTRL_REGISTER to every NEXT_LEVEL child in parallel. Throws on any failure."
+        )
+        .def(
+            "broadcast_unregister_all", &Worker::broadcast_unregister_all, nb::arg("cid"),
+            nb::call_guard<nb::gil_scoped_release>(),
+            "Best-effort broadcast of CTRL_UNREGISTER to every NEXT_LEVEL child in parallel. "
+            "Returns a list of per-child error strings (empty on full success)."
         );
 
     m.attr("DEFAULT_HEAP_RING_SIZE") = static_cast<uint64_t>(DEFAULT_HEAP_RING_SIZE);

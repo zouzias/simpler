@@ -45,7 +45,7 @@
 constexpr int32_t MAX_AICPU_THREADS = PLATFORM_MAX_AICPU_THREADS;
 
 constexpr int32_t MAX_IDLE_ITERATIONS = 800000;       // ~20s idle then scheduler gives up (avoid long hang)
-constexpr int32_t STALL_LOG_INTERVAL = 50000;         // LOG_INFO_V9 every N idle iters to debug hang
+constexpr int32_t STALL_LOG_INTERVAL = 400000;        // LOG_INFO_V9 every N idle iters to debug hang
 constexpr int32_t FATAL_ERROR_CHECK_INTERVAL = 1024;  // Check orchestrator error every N idle iters
 constexpr int32_t STALL_DUMP_READY_MAX = 8;
 constexpr int32_t STALL_DUMP_WAIT_MAX = 4;
@@ -81,9 +81,10 @@ struct alignas(64) CoreExecState {
     uint8_t pad0_[2];                       // offset 38: alignment padding
 #if PTO2_PROFILING
     // --- Profiling fields (dispatch path, compile-time gated) ---
-    uint64_t running_dispatch_timestamp;  // offset 40: AICPU dispatch timestamp for running task
-    uint64_t pending_dispatch_timestamp;  // offset 48: AICPU dispatch timestamp for pending task
-    uint8_t pad1_[8];                     // offset 56: pad to 64 bytes
+    uint32_t dispatch_count;              // offset 40: dispatched task count (buffer mgmt)
+    uint32_t pad1_;                       // offset 44: alignment padding for timestamp
+    uint64_t running_dispatch_timestamp;  // offset 48: AICPU dispatch timestamp for running task
+    uint64_t pending_dispatch_timestamp;  // offset 56: AICPU dispatch timestamp for pending task
 #else
     // --- Cold fields (init/diagnostics only, never in hot path) ---
     int32_t worker_id;          // offset 40: index in runtime.workers[]
@@ -212,6 +213,10 @@ public:
             return ((core_states_ >> 1) | (core_states_ >> 2)) & aic_mask_;
         case PTO2ResourceShape::MIX:
             return (core_states_ >> 1) & (core_states_ >> 2) & core_states_ & aic_mask_;
+        case PTO2ResourceShape::DUMMY:
+            // DUMMY tasks never reach the core-tracker dispatch path; they are
+            // completed inline by resolve_and_dispatch via dummy_ready_queue.
+            return BitStates(0ULL);
         }
         return BitStates(0ULL);
     }
@@ -344,17 +349,17 @@ struct alignas(64) SchedL2PerfCounters {
     uint64_t sched_loop_count{0};
     uint32_t phase_complete_count{0};
     uint32_t phase_dispatch_count{0};
+    // Run-cumulative pop counters; the v2 JSON dispatch-record emitter writes
+    // per-emit deltas computed as (current - pop_*_at_last_emit) and the
+    // end-of-run cold-path log reads the cumulatives directly.
+    uint64_t pop_hit{0};
+    uint64_t pop_miss{0};
+    uint64_t pop_hit_at_last_emit{0};
+    uint64_t pop_miss_at_last_emit{0};
 #if PTO2_SCHED_PROFILING
     uint32_t phase_wiring_count{0};
     uint64_t complete_probe_count{0};
     uint64_t complete_hit_count{0};
-    uint64_t notify_edges_total{0};
-    int32_t notify_max_degree{0};
-    uint64_t notify_tasks_enqueued{0};
-    uint64_t fanin_edges_total{0};
-    int32_t fanin_max_degree{0};
-    uint64_t pop_hit{0};
-    uint64_t pop_miss{0};
     uint64_t local_dispatch_count{0};
     uint64_t local_overflow_count{0};
     uint64_t sched_complete_perf_cycle{0};

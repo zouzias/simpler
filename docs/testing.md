@@ -80,7 +80,7 @@ Scene tests support advanced CLI options for benchmarking, profiling, and runtim
 pytest --platform a2a3sim                                        # default: 1 round + golden
 pytest --platform a2a3 --rounds 100 --skip-golden                # benchmark mode
 pytest --platform a2a3 --enable-l2-swimlane                             # L2 swimlane (first round)
-pytest --platform a2a3 --enable-pmu                              # PMU CSV (LuoPan)
+pytest --platform a2a3 --enable-pmu                              # PMU CSV
 pytest --platform a2a3sim --build                                # compile runtime from source
 pytest --platform a2a3sim --log-level debug                        # verbose C++ logging
 ```
@@ -114,14 +114,16 @@ python test_xxx.py -p a2a3sim --log-level debug                  # verbose C++ l
 | `--enable-pmu [EVENT_TYPE]` | | `0` | Enable a2a3 PMU CSV collection. Bare flag selects `PIPE_UTILIZATION` (`2`); pass an event type such as `4` for `MEMORY`. |
 | `--build` | | false | Compile runtime from source (not pre-built) |
 | `--exitfirst` | `-x` | false | Stop on first failing test (fail-fast, primarily for CI) |
-| `--log-level LEVEL` | | `v5` | Simpler logger threshold. Accepts `debug` / `V0..V9` / `info` / `warn` / `error` / `null`. The "simpler" Python logger is the single source of truth; the value is propagated to host C++ `HostLogger` and AICPU via `KernelArgs` automatically on each `Worker.run()`. Onboard AICPU **severity** stays managed by CANN (`ASCEND_GLOBAL_LOG_LEVEL` / `dlog_setlevel`); only the INFO **verbosity** sub-tier is plumbed via simpler. See [Log levels](#log-levels). |
+| `--log-level LEVEL` | | `v5` | Simpler logger threshold. Accepts `debug` / `V0..V9` / `info` / `warn` / `error` / `null` (case-insensitive). pytest's own CLI validator does `int(getattr(logging, level.upper(), level))`, so the V tiers and `NUL`/`NULL` are exposed as attributes on the `logging` module via `setattr` (registration in `conftest.py` runs before pytest's option machinery). `logging.addLevelName` is also called so `%(levelname)s` formatters print `V3` instead of `Level 18`, but it is not what makes the CLI parser accept the value. The "simpler" Python logger is the single source of truth; the value is snapshotted into the platform SO at `Worker.init()` time (not per `Worker.run()`) and pushed to host `HostLogger`, runner state, and (onboard) CANN `dlog_setlevel`. AICPU receives it via `KernelArgs.log_info_v`. Changing the Python logger level after `Worker.init()` does not retroactively affect that worker. See [Log levels](#log-levels). |
 
 Profiling is enabled only on the first round to avoid overhead on subsequent iterations. Output tensors are reset to their initial values between rounds.
 
 ## Log levels
 
 Simpler ties two axes (severity + INFO sub-verbosity) into a single integer
-threshold so users only ever set one knob.
+threshold so users only ever set one knob. For implementation details
+(`libsimpler_log.so`, multi-`.so` singleton, host vs device backends, output
+formats), see [logging.md](logging.md).
 
 ### Integer layout (Python-aligned)
 
@@ -161,21 +163,33 @@ visible by default; lower the threshold (e.g. `--log-level warn`) to hide them.
   already called `setLevel`. Inheritance from the root logger is intentionally
   not used so `import simpler` doesn't kill INFO output by inheriting Python's
   default `WARNING`.
-- `Worker.run()` snapshots the current logger level into `CallConfig.log_level`
-  / `CallConfig.log_info_v`, which travel through `KernelArgs` to AICPU.
-- `pto_runtime_c_api::run_runtime` also pushes the same values into the
-  per-process `HostLogger` so host `LOG_*` calls in the platform SO see the
-  user's threshold.
+- `V0..V9` and `NUL` are registered with `logging.addLevelName` at import,
+  so name-based callers (`pytest --log-level v3`, `logger.setLevel("V3")`,
+  formatters writing `%(levelname)s`) accept and emit them.
+- **Snapshot at `Worker.init()`, not per-run**: when a `Worker` is initialised
+  it reads the current `simpler` logger level once and forwards it through
+  `ChipWorker.init(..., log_level, log_info_v)`. ChipWorker then calls
+  libsimpler_log's `simpler_log_init` (which writes the values into the
+  process-wide `HostLogger` singleton) BEFORE `host_runtime.so` is dlopen'd;
+  the platform SO's `simpler_init` reads `HostLogger.level()` to sync CANN
+  `dlog` onboard, and per-launch the runner reads `HostLogger.level() / .info_v()`
+  directly when populating `KernelArgs`. **Subsequent `logger.setLevel(...)`
+  calls are not re-pushed to that worker** — recreate the worker if you need
+  to change levels mid-run.
+- L3 / L4 hierarchical workers fork chip subprocesses; the parent snapshots
+  the same `(severity, info_v)` pair before `fork()` and passes it explicitly
+  to `_chip_process_loop` so each subprocess starts its own `ChipWorker.init`
+  with the correct values.
 
 ### Onboard AICPU severity is CANN-owned
 
 The onboard AICPU library reads severity from CANN's `dlog` (CheckLogLevel),
 not from `KernelArgs.log_level`. Configure it via
 `ASCEND_GLOBAL_LOG_LEVEL=0..4` or `dlog_setlevel(-1, level, 0)`.
-`simpler/__init__.py` calls `dlog_setlevel(-1, INFO, 0)` once at import
-unless `ASCEND_GLOBAL_LOG_LEVEL` is already set, so the onboard default is
-INFO out of the box. The INFO **verbosity** sub-tier (V0..V9) is still
-controlled through the simpler logger.
+`simpler_init` (called from `ChipWorker::init` in the platform SO) issues
+`dlog_setlevel(-1, HostLogger.level(), 0)` automatically — unless
+`ASCEND_GLOBAL_LOG_LEVEL` is already set in the environment. The INFO **verbosity** sub-tier (V0..V9) is still
+controlled through the simpler logger and travels via `KernelArgs.log_info_v`.
 
 ### Behaviour change since the V0..V9 migration
 
@@ -529,7 +543,7 @@ add_test(NAME test_my_component COMMAND test_my_component)
 Tests that need specific NPU devices use CTest's [resource allocation](https://cmake.org/cmake/help/latest/prop_test/RESOURCE_GROUPS.html). Declare `RESOURCE_GROUPS` alongside the hardware label:
 
 ```cmake
-set_tests_properties(test_hccl_comm PROPERTIES
+set_tests_properties(my_hw_test PROPERTIES
     LABELS "requires_hardware_a2a3"
     RESOURCE_GROUPS "2,npus:1"    # 2 groups × 1 NPU slot each = 2 distinct devices
 )
@@ -558,7 +572,7 @@ CTest passes allocated device ids via environment variables:
 - `CTEST_RESOURCE_GROUP_COUNT` — number of groups
 - `CTEST_RESOURCE_GROUP_<n>_NPUS` — `"id:<device_id>,slots:1"` per group
 
-Tests read these to determine which devices to use. See `test_hccl_comm.cpp::read_ctest_devices()` for the parsing pattern.
+Tests read these to determine which devices to use. See `test_comm_lifecycle.cpp::read_ctest_devices()` for the parsing pattern.
 
 ### New Scene Test
 

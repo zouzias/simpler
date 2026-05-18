@@ -6,6 +6,21 @@ This document describes the profiling macro hierarchy and logging control in the
 
 PTO Runtime2 uses a hierarchical profiling system with compile-time macros to control profiling code compilation and log output. The `enable_l2_swimlane` runtime flag controls data collection (performance buffers, shared memory writes) but does NOT control log output.
 
+### CI coverage
+
+The default CI build leaves `PTO2_PROFILING=1` (base) and the three sub-flags (`PTO2_ORCH_PROFILING`, `PTO2_SCHED_PROFILING`, `PTO2_TENSORMAP_PROFILING`) at `0`. The `profiling-flags-smoke` job in `.github/workflows/ci.yml` exercises the non-default combinations and runs the smallest full-pipeline example (`examples/<arch>/tensormap_and_ringbuffer/vector_example/`) against the rebuilt binaries:
+
+| Combo | `CXX` defines |
+| ----- | ------------- |
+| `pto2-off` | `-DPTO2_PROFILING=0` |
+| `orch` | `-DPTO2_ORCH_PROFILING=1` |
+| `orch-tensormap` | `-DPTO2_ORCH_PROFILING=1 -DPTO2_TENSORMAP_PROFILING=1` |
+| `sched` | `-DPTO2_SCHED_PROFILING=1` |
+| `orch-sched` | `-DPTO2_ORCH_PROFILING=1 -DPTO2_SCHED_PROFILING=1` |
+| `all-on` | `-DPTO2_ORCH_PROFILING=1 -DPTO2_SCHED_PROFILING=1 -DPTO2_TENSORMAP_PROFILING=1` |
+
+Each combo runs sequentially on both `a2a3sim` and `a5sim` inside a single CI job (12 iterations total in one bash loop, not a matrix — apt/python/pip setup is paid once instead of 12 times). Failures across iterations are accumulated and reported together at the end. Compile failures, format-string mismatches, runtime crashes, or output-shape regressions in any individually gated code path show up there with the failing leg attributing the specific switch.
+
 ## Profiling Macro Hierarchy
 
 ```text
@@ -148,14 +163,14 @@ Thread 1: Scheduler summary: total_time=168.620us, loops=3880, tasks_scheduled=9
 
 ```text
 Thread X: === Scheduler Phase Breakdown: total=XXXus, XXX tasks ===
-Thread X:   complete       : XXXus (XX.X%)  [fanout: edges=XXX, max_degree=X, avg=X.X]  [fanin: edges=XXX, max_degree=X, avg=X.X]
+Thread X:   complete       : XXXus (XX.X%)
 Thread X:     poll         : XXXus (XX.X%)  hit=XXX, miss=XXX, hit_rate=XX.X%
 Thread X:     otc_lock     : XXXus (XX.X%)  work=XXXus wait=XXXus  atomics=XXX
 Thread X:     otc_fanout   : XXXus (XX.X%)  work=XXXus wait=XXXus  atomics=XXX
 Thread X:     otc_fanin    : XXXus (XX.X%)  atomics=XXX
 Thread X:     otc_self     : XXXus (XX.X%)  atomics=XXX
 Thread X:     perf         : XXXus (XX.X%)
-Thread X:   dispatch       : XXXus (XX.X%)  [pop: hit=XXX, miss=XXX, hit_rate=XX.X%]
+Thread X:   dispatch       : XXXus (XX.X%)
 Thread X:     poll         : XXXus (XX.X%)
 Thread X:     pop          : XXXus (XX.X%)  work=XXXus wait=XXXus  atomics=XXX
 Thread X:     setup        : XXXus (XX.X%)
@@ -164,6 +179,10 @@ Thread X:   idle           : XXXus (XX.X%)
 Thread X:   avg/complete   : XXXus
 Thread X: Scheduler summary: total_time=XXXus, loops=XXX, tasks_scheduled=XXX
 ```
+
+Per-thread fanout / fanin edge counts and ready-queue pop hit / miss
+stats live in the v2 JSON `aicpu_scheduler_phases[]` and `deps.json`;
+consume them via `simpler_setup/tools/sched_overhead_analysis.py`.
 
 ---
 

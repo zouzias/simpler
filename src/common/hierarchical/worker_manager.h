@@ -16,18 +16,11 @@
  * Provides idle-worker selection and dispatch to the Scheduler.
  * The Scheduler drives the DAG; the Manager drives the workers.
  *
- * Each WorkerThread operates in one of two modes:
- *
- *   THREAD  — calls `worker_->run(callable, view, config)` directly in
- *             the parent process.
- *   PROCESS — encodes `(callable, config, args_blob)` into a pre-forked
- *             child's shared-memory mailbox, signals TASK_READY, and
- *             spin-polls TASK_DONE. The child process loop (Python) reads
- *             the mailbox and calls the appropriate IWorker / Python
- *             callable in its own address space.
- *
- * PROCESS mode absorbs the logic that used to live in the standalone
- * `ChipProcess` and `SubWorker` classes (deleted in PR-D-2).
+ * Each WorkerThread encodes `(callable, config, args_blob)` into a
+ * pre-forked child's shared-memory mailbox, signals TASK_READY, and
+ * spin-polls TASK_DONE. The child process loop (Python) reads the
+ * mailbox and calls the appropriate IWorker / Python callable in its
+ * own address space.
  */
 
 #pragma once
@@ -42,6 +35,7 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -57,8 +51,7 @@ class WorkerManager;
 //
 // One layout for both NEXT_LEVEL (chip) and SUB workers. SUB children
 // read `callable` as a uint64 encoding the callable_id and ignore
-// config + args_blob. Matches the former ChipProcess layout at the
-// byte level so the chip child loop in Python needs no offset changes.
+// config + args_blob.
 
 enum class MailboxState : int32_t {
     IDLE = 0,
@@ -106,9 +99,17 @@ static constexpr uint64_t CTRL_MALLOC = 0;
 static constexpr uint64_t CTRL_FREE = 1;
 static constexpr uint64_t CTRL_COPY_TO = 2;
 static constexpr uint64_t CTRL_COPY_FROM = 3;
+// Pre-warm a chip child for cid=arg0 by calling prepare_callable in the child;
+// issued at end of init() so the first run_prepared does not pay the H2D cost.
+static constexpr uint64_t CTRL_PREPARE = 4;
+// Dynamic post-init register/unregister of a ChipCallable. CTRL_REGISTER carries
+// (cid, shm_name) with bytes staged in POSIX shm by the parent;
+// CTRL_UNREGISTER carries only the cid.
+static constexpr uint64_t CTRL_REGISTER = 5;
+static constexpr uint64_t CTRL_UNREGISTER = 6;
 
 // Control args reuse the task mailbox region (mutually exclusive with task dispatch):
-//   offset 16: uint64 arg0 (size for malloc; ptr for free; dst for copy)
+//   offset 16: uint64 arg0 (size for malloc; ptr for free; dst for copy; cid for register)
 //   offset 24: uint64 arg1 (src for copy)
 //   offset 32: uint64 arg2 (nbytes for copy)
 //   offset 40: uint64 result (returned ptr from malloc)
@@ -116,6 +117,11 @@ static constexpr ptrdiff_t CTRL_OFF_ARG0 = 16;
 static constexpr ptrdiff_t CTRL_OFF_ARG1 = 24;
 static constexpr ptrdiff_t CTRL_OFF_ARG2 = 32;
 static constexpr ptrdiff_t CTRL_OFF_RESULT = 40;
+
+// CTRL_REGISTER puts the NUL-terminated POSIX shm name at MAILBOX_OFF_ARGS.
+// Fixed-width so the wire layout stays simple; well above the encoded length
+// of "simpler-cb-<pid>-<cid>-<counter>" with pid < 32-bit max.
+static constexpr size_t CTRL_SHM_NAME_BYTES = 32;
 
 // =============================================================================
 // WorkerDispatch — per-dispatch handle handed to a WorkerThread.
@@ -131,13 +137,11 @@ struct WorkerDispatch {
 };
 
 // =============================================================================
-// WorkerThread — one worker, one std::thread, two execution modes.
+// WorkerThread — one worker, one std::thread, mailbox-IPC dispatch.
 // =============================================================================
 
 class WorkerThread {
 public:
-    enum class Mode { THREAD, PROCESS };
-
     WorkerThread() = default;
     ~WorkerThread() { stop(); }
     WorkerThread(const WorkerThread &) = delete;
@@ -145,12 +149,9 @@ public:
 
     // Start the worker thread.
     //
-    // THREAD mode: `worker` is called directly via `worker->run(...)`.
-    //   `mailbox` must be nullptr.
-    //
-    // PROCESS mode: `worker` is nullptr (the real IWorker lives in the
-    //   forked child). `mailbox` points to a MAILBOX_SIZE-byte
-    //   MAP_SHARED region managed by the Python facade.
+    // `mailbox` points to a MAILBOX_SIZE-byte MAP_SHARED region managed
+    // by the Python facade — the real IWorker lives in the forked child
+    // and consumes the mailbox via `_chip_process_loop` / `_sub_worker_loop`.
     //
     // `ring` is a borrowed pointer to the engine's slot-state pool —
     // the thread reads callable/args/config from
@@ -158,10 +159,7 @@ public:
     // on_complete(slot) is called (in the WorkerThread) after each run().
     // `manager` is a borrowed pointer used to report dispatch failures
     // (exception_ptr routed out of the worker thread to the orch thread).
-    void start(
-        Mode mode, IWorker *worker, Ring *ring, WorkerManager *manager,
-        const std::function<void(TaskSlot)> &on_complete, void *mailbox = nullptr
-    );
+    void start(Ring *ring, WorkerManager *manager, const std::function<void(TaskSlot)> &on_complete, void *mailbox);
 
     // Enqueue a dispatch for the worker. Non-blocking.
     void dispatch(WorkerDispatch d);
@@ -171,23 +169,37 @@ public:
 
     void stop();
 
-    // PROCESS mode only: write SHUTDOWN to the mailbox so the child
-    // process exits its loop. No-op in THREAD mode. Does NOT waitpid —
-    // the Python facade owns the child PID.
+    // Write SHUTDOWN to the mailbox so the child process exits its loop.
+    // Does NOT waitpid — the Python facade owns the child PID.
     void shutdown_child();
 
     // Memory control — callable from the orch thread while the worker
-    // thread may be running a task (MemoryAllocator is mutex-protected).
-    // THREAD mode: direct call on the ChipWorker.
-    // PROCESS mode: control command via mailbox (blocks until child responds).
+    // thread may be running a task. Issues a control command via the
+    // mailbox and blocks until the child responds.
+    //
+    // The mailbox is a single shared region; dispatch_process and the
+    // control_* methods both write its state field. They serialize on
+    // `mailbox_mu_` so a control request issued mid-dispatch waits for
+    // TASK_DONE before claiming the mailbox.
     uint64_t control_malloc(size_t size);
     void control_free(uint64_t ptr);
     void control_copy_to(uint64_t dst, uint64_t src, size_t size);
     void control_copy_from(uint64_t dst, uint64_t src, size_t size);
 
+    // Pre-warm a chip child by triggering prepare_callable for `cid` in the
+    // child via CTRL_PREPARE. Issued from the parent at end of init() so the
+    // first run_prepared does not pay the H2D upload cost.
+    void control_prepare(int32_t cid);
+
+    // Dynamic post-init register/unregister of a ChipCallable for `cid`.
+    // `shm_name` is the (NUL-terminated, ≤ CTRL_SHM_NAME_BYTES-1) POSIX shm
+    // name where the ChipCallable bytes are staged. Both methods hold
+    // mailbox_mu_, so a CTRL_REGISTER concurrent with dispatch_process waits
+    // for the in-flight TASK_DONE before claiming the mailbox.
+    void control_register(int32_t cid, const char *shm_name);
+    void control_unregister(int32_t cid);
+
 private:
-    Mode mode_{Mode::THREAD};
-    IWorker *worker_{nullptr};
     Ring *ring_{nullptr};
     WorkerManager *manager_{nullptr};
     void *mailbox_{nullptr};
@@ -200,9 +212,18 @@ private:
     bool shutdown_{false};
     std::atomic<bool> idle_{true};
 
+    // Serializes parent-side mailbox access between this WorkerThread's
+    // dispatch loop and the orch-thread control_* path. Per-WorkerThread,
+    // so different workers can dispatch in parallel.
+    std::mutex mailbox_mu_;
+
     void loop();
-    void dispatch_thread(TaskSlotState &s, int32_t group_index);
     void dispatch_process(TaskSlotState &s, int32_t group_index);
+
+    // Common tail for the four control_* methods. Caller writes the args
+    // region and holds `mailbox_mu_`; this helper signals the child,
+    // spin-polls CONTROL_DONE, and throws on a non-zero child error code.
+    void run_control_command(const char *op_name);
 
     char *mbox() const { return static_cast<char *>(mailbox_); }
     MailboxState read_mailbox_state() const;
@@ -217,14 +238,10 @@ class WorkerManager {
 public:
     using OnCompleteFn = std::function<void(TaskSlot)>;
 
-    // THREAD mode: worker is called directly.
-    void add_next_level(IWorker *worker);
-    void add_sub(IWorker *worker);
-
-    // PROCESS mode: mailbox is a MAILBOX_SIZE-byte MAP_SHARED region.
-    // Worker is nullptr (child has its own).
-    void add_next_level_process(void *mailbox);
-    void add_sub_process(void *mailbox);
+    // Register a worker. `mailbox` is a MAILBOX_SIZE-byte MAP_SHARED
+    // region; the real IWorker lives in the forked child.
+    void add_next_level(void *mailbox);
+    void add_sub(void *mailbox);
 
     void start(Ring *ring, const OnCompleteFn &on_complete);
     void stop();
@@ -240,7 +257,26 @@ public:
 
     bool any_busy() const;
 
-    // Write SHUTDOWN to every PROCESS-mode mailbox.
+    // Forward CTRL_PREPARE to a specific NEXT_LEVEL worker. Thin wrapper
+    // over WorkerThread::control_prepare; exposed at manager level so the
+    // Python facade can prewarm without reaching into individual WorkerThreads.
+    void control_prepare(int worker_id, int32_t cid);
+
+    // Broadcast CTRL_REGISTER for `cid` to every NEXT_LEVEL worker in
+    // parallel. Stages `blob_size` bytes from `blob_ptr` into a per-call
+    // POSIX shm under name "simpler-cb-<pid>-<cid>-<counter>", spawns one
+    // std::thread per WorkerThread, and joins. Throws on any child failure
+    // (with no reverse rollback to ACKed children — partial state is inert
+    // garbage and is overwritten on cid reuse). The shm is unlinked when
+    // every leaf has ACKed (success or failure).
+    void broadcast_register_all(int32_t cid, const void *blob_ptr, size_t blob_size);
+
+    // Best-effort: broadcast CTRL_UNREGISTER for `cid` to every NEXT_LEVEL
+    // worker in parallel. Returns a vector of per-worker error strings
+    // (empty on full success). Caller decides whether to log / surface.
+    std::vector<std::string> broadcast_unregister_all(int32_t cid);
+
+    // Write SHUTDOWN to every registered mailbox.
     void shutdown_children();
 
     // Error propagation: first dispatch failure from any WorkerThread wins.
@@ -252,14 +288,8 @@ public:
     void clear_error();
 
 private:
-    struct WorkerEntry {
-        IWorker *worker;  // nullptr for PROCESS mode
-        WorkerThread::Mode mode;
-        void *mailbox;  // nullptr for THREAD mode
-    };
-
-    std::vector<WorkerEntry> next_level_entries_;
-    std::vector<WorkerEntry> sub_entries_;
+    std::vector<void *> next_level_entries_;
+    std::vector<void *> sub_entries_;
 
     std::vector<std::unique_ptr<WorkerThread>> next_level_threads_;
     std::vector<std::unique_ptr<WorkerThread>> sub_threads_;

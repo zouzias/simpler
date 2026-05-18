@@ -26,12 +26,34 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "aicpu/dep_gen_collector_aicpu.h"
+#include "common/dep_gen.h"
 #include "common/unified_log.h"
+#include "pto_dep_compute.h"
 #include "pto_runtime2_types.h"
 #include "pto_shared_memory.h"
 #include "pto_tensormap.h"
 #include "pto_types.h"
 #include "tensor.h"
+
+// Verify the captured Tensor blob size in DepGenRecord matches the runtime
+// Tensor layout. The platform header defines DEP_GEN_TENSOR_SIZE without
+// including runtime/tensor.h, so this check lives at the orch callsite.
+static_assert(sizeof(Tensor) == DEP_GEN_TENSOR_SIZE, "DepGenRecord::tensors slot size out of sync with sizeof(Tensor)");
+// DEP_GEN_MAX_EXPLICIT_DEPS is a diagnostic-side capture cap only; the runtime
+// imposes no hard cap on explicit dep count. If a submit exceeds this cap,
+// dep_gen_aicpu_record_submit() logs and truncates — runtime correctness is
+// unaffected, only the captured replay record is truncated.
+
+// Weak fallbacks: dep_gen_collector_aicpu.cpp provides the strong symbols in
+// AICPU builds. Host builds (host_build_graph runtime, future dep_gen replay)
+// link these no-op stubs so the runtime translation unit is self-contained.
+// Visibility is hidden so the HOST .so doesn't export them into the global
+// dynamic symbol table where they'd shadow the AICPU .so's strong symbols
+// (same pattern as get_sys_cnt_aicpu / l2_perf_aicpu_record_orch_phase below).
+extern "C" __attribute__((weak, visibility("hidden"))) bool is_dep_gen_enabled() { return false; }
+__attribute__((weak, visibility("hidden"))) void
+dep_gen_aicpu_record_submit(uint64_t, bool, int, const void *const *, const uint8_t *, int, const uint64_t *) {}
 
 // =============================================================================
 // Orchestrator Profiling (compile-time toggle)
@@ -70,8 +92,6 @@ uint64_t g_orch_alloc_wait_cycle = 0;
 uint64_t g_orch_fanin_wait_cycle = 0;
 uint64_t g_orch_alloc_atomic_count = 0;
 uint64_t g_orch_args_atomic_count = 0;
-uint64_t g_orch_fanin_atomic_count = 0;
-uint64_t g_orch_finalize_atomic_count = 0;
 uint64_t g_orch_scope_end_atomic_count = 0;
 #define CYCLE_COUNT_START() uint64_t _t0 = get_sys_cnt_aicpu(), _t1
 #define CYCLE_COUNT_LAP(acc)       \
@@ -213,7 +233,10 @@ static bool append_fanin_or_fail(
     }
 
     PTO2FaninPool &fanin_pool = fanin_builder->spill_pool;
-    fanin_pool.ensure_space(orch->sm_header->rings[ring_id], 1);
+    if (!fanin_pool.ensure_space(orch->sm_header->rings[ring_id], 1)) {
+        orch_mark_fatal(orch, PTO2_ERROR_DEP_POOL_OVERFLOW);
+        return false;
+    }
     int32_t spill_idx = fanin_pool.top;
     PTO2FaninSpillEntry *entry = fanin_pool.alloc();
     if (entry == nullptr) {
@@ -503,69 +526,18 @@ void PTO2OrchestratorState::end_scope() {
 // =============================================================================
 // Task Submission
 // =============================================================================
-TaskOutputTensors PTO2OrchestratorState::submit_task(const MixedKernels &mixed_kernels, const Arg &args) {
-    auto *orch = this;
+
+// Shared body for submit_task / submit_dummy_task. Caller has already validated
+// args.has_error, decided active_mask (empty for dummy), and resolved the per-slot
+// kernel_ids (all INVALID_KERNEL_ID for dummy). Performs tensormap sync, fanin
+// computation (explicit_deps + auto), output registration, slot init, and pushes
+// to the scheduler wiring queue.
+static TaskOutputTensors submit_task_common(
+    PTO2OrchestratorState *orch, const Arg &args, ActiveMask active_mask, int32_t aic_kernel_id, int32_t aiv0_kernel_id,
+    int32_t aiv1_kernel_id
+) {
     CYCLE_COUNT_START();
-
     TaskOutputTensors result;
-
-    // Orchestration API should short-circuit after fatal, but keep this entry
-    // robust as a no-op in case a caller reaches it directly.
-    if (orch->fatal) {
-        return result;
-    }
-
-    // Validate Arg construction (errors recorded by add_input/add_output/etc.)
-    if (args.has_error) {
-        LOG_ERROR("========================================");
-        LOG_ERROR("FATAL: Invalid Arg Detected!");
-        LOG_ERROR("========================================");
-        LOG_ERROR("Error: %s", args.error_msg ? args.error_msg : "(unknown)");
-        LOG_ERROR("  tensor_count: %d, scalar_count: %d", args.tensor_count(), args.scalar_count());
-        LOG_ERROR("This is a bug in the orchestration code.");
-        LOG_ERROR("========================================");
-        orch_mark_fatal(orch, PTO2_ERROR_INVALID_ARGS);
-        return result;
-    }
-    always_assert(orch->scheduler != nullptr);
-    // === Validate submit inputs ===
-    ActiveMask active_mask = mixed_kernels.to_active_mask();
-    always_assert(static_cast<bool>(active_mask) && "MixedKernels must have at least one active slot");
-
-    int16_t block_num = args.launch_spec.block_num();
-    always_assert(block_num >= 1 && "block_num must be >= 1");
-
-    // Normalize single-AIV tasks: if only aiv1 is set (no aic, no aiv0), move
-    // it to the aiv0 slot.  This guarantees the dispatch path can always use
-    // PTO2SubtaskSlot::AIV0 for single-AIV shapes without inspecting active_mask.
-    // Mixed tasks (AIC+AIV) keep their original AIV identity so the correct
-    // hardware channel (AIV0→AIC vs AIV1→AIC) is used at dispatch time.
-    MixedKernels normalized = mixed_kernels;
-    bool has_aic = active_mask.has_mask(PTO2_SUBTASK_MASK_AIC);
-    bool has_aiv0 = active_mask.has_mask(PTO2_SUBTASK_MASK_AIV0);
-    bool has_aiv1 = active_mask.has_mask(PTO2_SUBTASK_MASK_AIV1);
-    if (!has_aic && has_aiv1 && !has_aiv0) {
-        normalized.aiv0_kernel_id = normalized.aiv1_kernel_id;
-        normalized.aiv1_kernel_id = INVALID_KERNEL_ID;
-        active_mask = normalized.to_active_mask();
-    }
-
-    // Encode require_sync_start into active_mask bit 3 (only meaningful for tasks with block_num > 1)
-    if (block_num > 1 && args.launch_spec.require_sync_start()) {
-        // Deadlock check: block_num >= total available slots of the required type.
-        // For MIX/AIC: limit is total_cluster_count (one AIC per cluster).
-        // For AIV:     limit is total_aiv_count.
-        PTO2ResourceShape shape = active_mask.to_shape();
-        int32_t limit = (shape == PTO2ResourceShape::AIV) ? orch->total_aiv_count : orch->total_cluster_count;
-        if (limit > 0 && block_num > limit) {
-            report_fatal(
-                PTO2_ERROR_REQUIRE_SYNC_START_INVALID, __FUNCTION__,
-                "require_sync_start block_num=%d > limit=%d (deadlock guaranteed)", block_num, limit
-            );
-            return result;
-        }
-        active_mask.set_sync_start();
-    }
     PTO2OutputLayout layout = calculate_output_layout(args);
     PTO2PreparedTask prepared;
     if (!prepare_task(orch, args, layout.total_output_size, active_mask, &prepared)) {
@@ -579,6 +551,39 @@ TaskOutputTensors PTO2OrchestratorState::submit_task(const MixedKernels &mixed_k
     PTO2TaskDescriptor &task = *prepared.task;
     PTO2TaskPayload &payload = *prepared.payload;
     result.set_task_id(task_id);
+
+    // dep_gen capture point: snapshot the orch submit_task inputs while the
+    // tensormap is still in its pre-lookup state for this task. Replay reads
+    // these records offline to reconstruct the complete dep graph, sidestepping
+    // the race window in L2PerfRecord::fanout[] where an early-finishing
+    // producer's record gets sealed before later-submitted consumers can
+    // register themselves.
+    if (is_dep_gen_enabled()) {
+        const void *tensor_ptrs[MAX_TENSOR_ARGS];
+        // TensorArgType is `enum class : int32_t` (4 bytes); the on-disk record
+        // packs arg_types as uint8_t[16] (5-value enum fits in a byte). Narrow
+        // each tag here rather than letting the AICPU writer reinterpret a
+        // 4×-wider array as bytes — that path silently lost two of every three
+        // tags on little-endian and synthesized phantom self-edges in replay.
+        uint8_t arg_types_u8[MAX_TENSOR_ARGS];
+        // Clamp to MAX_TENSOR_ARGS even though the Arg builder caps adds at
+        // MAX_TENSOR_ARGS: defensive against any future builder bypass /
+        // shared-memory bit-flip that could otherwise overrun the two
+        // MAX_TENSOR_ARGS-sized stack buffers above.
+        const int tc_raw = args.tensor_count();
+        const int tc = tc_raw > MAX_TENSOR_ARGS ? MAX_TENSOR_ARGS : tc_raw;
+        for (int i = 0; i < tc; i++) {
+            // OUTPUT slots carry create_info (not yet a Tensor); skip them —
+            // they have no producer to look up and replay's per-tensor loop
+            // also skips OUTPUT.
+            tensor_ptrs[i] = (args.tag(i) == TensorArgType::OUTPUT) ? nullptr : args.tensor(i).ptr;
+            arg_types_u8[i] = static_cast<uint8_t>(args.tag(i));
+        }
+        dep_gen_aicpu_record_submit(
+            task_id.raw, orch->in_manual_scope(), tc, tensor_ptrs, arg_types_u8,
+            static_cast<int>(args.explicit_dep_count()), reinterpret_cast<const uint64_t *>(args.explicit_deps_data())
+        );
+    }
 
     PTO2FaninBuilder fanin_builder(orch->rings[ring_id].fanin_pool);
 
@@ -602,7 +607,9 @@ TaskOutputTensors PTO2OrchestratorState::submit_task(const MixedKernels &mixed_k
     for (uint32_t i = 0; i < args.explicit_dep_count(); i++) {
         PTO2TaskId dep_task_id = args.explicit_dep(i);
         if (!dep_task_id.is_valid()) {
-            report_fatal(PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "Arg.add_dep(...) requires a valid task id");
+            orch->report_fatal(
+                PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "Arg.set_dependencies(...) requires valid task ids"
+            );
             return result;
         }
         PTO2SharedMemoryRingHeader &dep_ring = orch->sm_header->rings[dep_task_id.ring()];
@@ -617,74 +624,26 @@ TaskOutputTensors PTO2OrchestratorState::submit_task(const MixedKernels &mixed_k
         }
     }
 
-    // === STEP 3: Lookup inputs + materialize runtime-created outputs ===
-    if (!orch->in_manual_scope()) {
-        for (int i = 0; i < args.tensor_count(); i++) {
-            TensorArgType ptype = args.tag(i);
-            if (ptype == TensorArgType::OUTPUT) {
-                // Runtime-created OUTPUT tensors are not looked up in the TensorMap since they have no dependencies.
-                continue;
-            }
+    // === STEP 3: Lookup inputs (creator retention + tensormap modifier lookup) ===
+    DepInputs dep_inputs{
+        args.tensor_count(),       args.tensor_data(), args.tag_data(), static_cast<int32_t>(args.explicit_dep_count()),
+        args.explicit_deps_data(),
+    };
 
-            const Tensor *tensor = args.tensor(i).ptr;
+    auto runtime_emit = [&](PTO2TaskId producer_task_id) -> bool {
+        PTO2TaskSlotState *prod_state =
+            &orch->sm_header->rings[producer_task_id.ring()].get_slot_state_by_task_id(producer_task_id.local());
+        return append_fanin_or_fail(orch, prod_state, &fanin_builder, ring_id);
+    };
 
-            // Step A: creator retention — all existing tensors extend their creator lifetime.
-            PTO2TaskId owner = tensor->owner_task_id;
-            if (owner.is_valid()) {
-                PTO2TaskSlotState *prod_state =
-                    &orch->sm_header->rings[owner.ring()].get_slot_state_by_task_id(owner.local());
-                if (prod_state->task != nullptr && prod_state->task->task_id == owner &&
-                    !append_fanin_or_fail(orch, prod_state, &fanin_builder, ring_id)) {
-                    return result;
-                }
-            }
-
-            // Step B: only INPUT/INOUT need modifier dependency lookup.
-            if (ptype != TensorArgType::INPUT && ptype != TensorArgType::INOUT) {
-                continue;
-            }
-            if (tensor->manual_dep) {
-                continue;
-            }
-
-            bool lookup_fatal = false;
-            orch->tensor_map.lookup(*tensor, [&](PTO2TensorMapEntry &entry, OverlapStatus overlap_status) -> bool {
-                PTO2TaskId producer_task_id = entry.producer_task_id;
-                PTO2TaskSlotState *prod_state =
-                    &orch->sm_header->rings[producer_task_id.ring()].get_slot_state_by_task_id(
-                        producer_task_id.local()
-                    );
-                if (prod_state->task == nullptr || prod_state->task->task_id != producer_task_id) {
-                    return true;
-                }
-                if (!append_fanin_or_fail(orch, prod_state, &fanin_builder, ring_id)) {
-                    lookup_fatal = true;
-                    return false;
-                }
-                if (ptype == TensorArgType::INOUT && overlap_status == OverlapStatus::COVERED) {
-                    orch->tensor_map.remove_entry(entry);
-                }
-                return true;
-            });
-            if (lookup_fatal) {
-                return result;
-            }
-        }
+    if (!compute_task_fanin(dep_inputs, orch->tensor_map, orch->in_manual_scope(), runtime_emit)) {
+        return result;
     }
 
     CYCLE_COUNT_LAP_RECORD(g_orch_lookup_cycle, AicpuPhaseId::ORCH_LOOKUP, task_id.raw);
 
     // === STEP 4: Register outputs/inouts in TensorMap (must be separate from lookup) ===
-    if (!orch->in_manual_scope()) {
-        for (int i = 0; i < args.tensor_count(); i++) {
-            TensorArgType ptype = args.tag(i);
-            if (ptype == TensorArgType::INOUT || ptype == TensorArgType::OUTPUT_EXISTING) {
-                if (!args.tensor(i).ptr->manual_dep) {
-                    orch->tensor_map.insert(*args.tensor(i).ptr, task_id);
-                }
-            }
-        }
-    }
+    register_task_outputs(dep_inputs, task_id, orch->tensor_map, orch->in_manual_scope());
 
     CYCLE_COUNT_LAP_RECORD(g_orch_insert_cycle, AicpuPhaseId::ORCH_INSERT, task_id.raw);
 
@@ -693,9 +652,9 @@ TaskOutputTensors PTO2OrchestratorState::submit_task(const MixedKernels &mixed_k
     // evicted by TensorMap lookup/insert cache pressure.
     __builtin_prefetch(&task, 1, 1);
     task.task_id = task_id;
-    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)] = normalized.aic_kernel_id;
-    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] = normalized.aiv0_kernel_id;
-    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)] = normalized.aiv1_kernel_id;
+    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)] = aic_kernel_id;
+    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] = aiv0_kernel_id;
+    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)] = aiv1_kernel_id;
     task.packed_buffer_base = prepared.alloc_result.packed_base;
     task.packed_buffer_end = prepared.alloc_result.packed_end;
 
@@ -743,6 +702,99 @@ TaskOutputTensors PTO2OrchestratorState::submit_task(const MixedKernels &mixed_k
     g_orch_submit_idx++;
 #endif
     return result;
+}
+
+TaskOutputTensors PTO2OrchestratorState::submit_task(const MixedKernels &mixed_kernels, const Arg &args) {
+    auto *orch = this;
+
+    // Orchestration API should short-circuit after fatal, but keep this entry
+    // robust as a no-op in case a caller reaches it directly.
+    if (orch->fatal) {
+        return TaskOutputTensors{};
+    }
+
+    // Validate Arg construction (errors recorded by add_input/add_output/etc.)
+    if (args.has_error) {
+        LOG_ERROR("========================================");
+        LOG_ERROR("FATAL: Invalid Arg Detected!");
+        LOG_ERROR("========================================");
+        LOG_ERROR("Error: %s", args.error_msg ? args.error_msg : "(unknown)");
+        LOG_ERROR("  tensor_count: %d, scalar_count: %d", args.tensor_count(), args.scalar_count());
+        LOG_ERROR("This is a bug in the orchestration code.");
+        LOG_ERROR("========================================");
+        orch_mark_fatal(orch, PTO2_ERROR_INVALID_ARGS);
+        return TaskOutputTensors{};
+    }
+    always_assert(orch->scheduler != nullptr);
+    // === Validate submit inputs ===
+    ActiveMask active_mask = mixed_kernels.to_active_mask();
+    always_assert(static_cast<bool>(active_mask) && "MixedKernels must have at least one active slot");
+
+    int16_t block_num = args.launch_spec.block_num();
+    always_assert(block_num >= 1 && "block_num must be >= 1");
+
+    // Normalize single-AIV tasks: if only aiv1 is set (no aic, no aiv0), move
+    // it to the aiv0 slot.  This guarantees the dispatch path can always use
+    // PTO2SubtaskSlot::AIV0 for single-AIV shapes without inspecting active_mask.
+    // Mixed tasks (AIC+AIV) keep their original AIV identity so the correct
+    // hardware channel (AIV0→AIC vs AIV1→AIC) is used at dispatch time.
+    MixedKernels normalized = mixed_kernels;
+    bool has_aic = active_mask.has_mask(PTO2_SUBTASK_MASK_AIC);
+    bool has_aiv0 = active_mask.has_mask(PTO2_SUBTASK_MASK_AIV0);
+    bool has_aiv1 = active_mask.has_mask(PTO2_SUBTASK_MASK_AIV1);
+    if (!has_aic && has_aiv1 && !has_aiv0) {
+        normalized.aiv0_kernel_id = normalized.aiv1_kernel_id;
+        normalized.aiv1_kernel_id = INVALID_KERNEL_ID;
+        active_mask = normalized.to_active_mask();
+    }
+
+    // Encode require_sync_start into active_mask bit 3 (only meaningful for tasks with block_num > 1)
+    if (block_num > 1 && args.launch_spec.require_sync_start()) {
+        // Deadlock check: block_num >= total available slots of the required type.
+        // For MIX/AIC: limit is total_cluster_count (one AIC per cluster).
+        // For AIV:     limit is total_aiv_count.
+        PTO2ResourceShape shape = active_mask.to_shape();
+        int32_t limit = (shape == PTO2ResourceShape::AIV) ? orch->total_aiv_count : orch->total_cluster_count;
+        if (limit > 0 && block_num > limit) {
+            report_fatal(
+                PTO2_ERROR_REQUIRE_SYNC_START_INVALID, __FUNCTION__,
+                "require_sync_start block_num=%d > limit=%d (deadlock guaranteed)", block_num, limit
+            );
+            return TaskOutputTensors{};
+        }
+        active_mask.set_sync_start();
+    }
+
+    return submit_task_common(
+        orch, args, active_mask, normalized.aic_kernel_id, normalized.aiv0_kernel_id, normalized.aiv1_kernel_id
+    );
+}
+
+// Submit a dependency-only task: full dependency graph participation
+// (tensormap lookup/insert, explicit_deps, manual_dep, manual_scope) but no
+// AICore dispatch. Empty active_mask routes the slot to the DUMMY ready
+// bucket; dispatch loop short-circuits to completion. Accepts the same Arg
+// shape as submit_task; scalars are permitted but never consumed.
+TaskOutputTensors PTO2OrchestratorState::submit_dummy_task(const Arg &args) {
+    auto *orch = this;
+
+    if (orch->fatal) {
+        return TaskOutputTensors{};
+    }
+
+    if (args.has_error) {
+        LOG_ERROR("========================================");
+        LOG_ERROR("FATAL: Invalid Arg in submit_dummy_task!");
+        LOG_ERROR("========================================");
+        LOG_ERROR("Error: %s", args.error_msg ? args.error_msg : "(unknown)");
+        LOG_ERROR("  tensor_count: %d, scalar_count: %d", args.tensor_count(), args.scalar_count());
+        LOG_ERROR("========================================");
+        orch_mark_fatal(orch, PTO2_ERROR_INVALID_ARGS);
+        return TaskOutputTensors{};
+    }
+    always_assert(orch->scheduler != nullptr);
+
+    return submit_task_common(orch, args, ActiveMask{}, INVALID_KERNEL_ID, INVALID_KERNEL_ID, INVALID_KERNEL_ID);
 }
 
 TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const Arg &args) {
@@ -882,8 +934,6 @@ PTO2OrchProfilingData orchestrator_get_profiling() {
     d.fanin_wait_cycle = g_orch_fanin_wait_cycle;
     d.alloc_atomic_count = g_orch_alloc_atomic_count;
     d.args_atomic_count = g_orch_args_atomic_count;
-    d.fanin_atomic_count = g_orch_fanin_atomic_count;
-    d.finalize_atomic_count = g_orch_finalize_atomic_count;
     d.scope_end_atomic_count = g_orch_scope_end_atomic_count;
 
     // Reset
@@ -896,8 +946,6 @@ PTO2OrchProfilingData orchestrator_get_profiling() {
     g_orch_fanin_wait_cycle = 0;
     g_orch_alloc_atomic_count = 0;
     g_orch_args_atomic_count = 0;
-    g_orch_fanin_atomic_count = 0;
-    g_orch_finalize_atomic_count = 0;
     g_orch_scope_end_atomic_count = 0;
     return d;
 }

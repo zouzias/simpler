@@ -499,48 +499,22 @@ def _build_output_prefix(case_label: str) -> Path:
     under that root with fixed filenames. Two cases of the same name run in
     the same second is not a contemplated scenario (parallel xdist runs differ
     by class+method).
+
+    The directory is created here: the dep_gen host replay (and any other
+    writer) ``fopen``s ``<prefix>/<file>`` directly without an mkdir of its
+    own, so the prefix must exist before the runtime call.
     """
     from datetime import datetime  # noqa: PLC0415
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_label = _sanitize_for_filename(case_label)
-    return _outputs_dir() / f"{safe_label}_{timestamp}"
-
-
-def _get_device_log_dir(device_id) -> Path:
-    """Return CANN device log directory (matches device_log_resolver)."""
-    ascend_work_path = os.environ.get("ASCEND_WORK_PATH")
-    if ascend_work_path:
-        root = Path(ascend_work_path).expanduser() / "log" / "debug"
-        if root.exists():
-            return root / f"device-{device_id}"
-    return Path.home() / "ascend" / "log" / "debug" / f"device-{device_id}"
-
-
-def _snapshot_device_logs(device_id) -> set[Path]:
-    log_dir = _get_device_log_dir(device_id)
-    return set(log_dir.glob("*.log")) if log_dir.exists() else set()
-
-
-def _wait_new_device_log(device_id, before: set[Path], timeout: float = 15.0) -> Path | None:
-    """Wait for a new CANN device log; returns the newest new file or None."""
-    import time  # noqa: PLC0415
-
-    log_dir = _get_device_log_dir(device_id)
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if log_dir.exists():
-            new = set(log_dir.glob("*.log")) - before
-            if new:
-                return max(new, key=lambda p: p.stat().st_mtime)
-        time.sleep(0.5)
-    return None
+    prefix = _outputs_dir() / f"{safe_label}_{timestamp}"
+    prefix.mkdir(parents=True, exist_ok=True)
+    return prefix
 
 
 def _run_swimlane_converter(
     input_path: Path | None = None,
-    device_id=None,
-    device_log: Path | None = None,
     func_names_path: Path | None = None,
 ) -> None:
     """Invoke the bundled swimlane converter as a subprocess.
@@ -558,10 +532,6 @@ def _run_swimlane_converter(
         cmd.append(str(input_path))
     if func_names_path is not None:
         cmd += ["--func-names", str(func_names_path)]
-    if device_log is not None:
-        cmd += ["--device-log", str(device_log)]
-    elif device_id is not None:
-        cmd += ["-d", str(device_id)]
     try:
         result = subprocess.run(cmd, check=True, capture_output=True, text=True)
         if result.stdout:
@@ -582,8 +552,6 @@ def _sanitize_for_filename(s: str) -> str:
 def _convert_case_swimlane(
     case_label: str,
     output_prefix: Path,
-    device_id,
-    before_device: set[Path] | None,
     callable_spec: dict | None = None,
 ) -> None:
     """Post-case: invoke the swimlane converter on the perf file the runtime
@@ -605,14 +573,7 @@ def _convert_case_swimlane(
         safe_label = _sanitize_for_filename(case_label)
         func_names_path = _dump_name_map(mapping, output_prefix / f"name_map_{safe_label}.json")
 
-    device_log = None
-    if before_device is not None:
-        device_log = _wait_new_device_log(device_id, before_device)
-        if device_log is None:
-            logger.warning(f"[{case_label}] no new device log found; scheduler deep-dive may use stale log")
-    _run_swimlane_converter(
-        input_path=perf_file, device_id=device_id, device_log=device_log, func_names_path=func_names_path
-    )
+    _run_swimlane_converter(input_path=perf_file, func_names_path=func_names_path)
 
 
 def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI surface
@@ -622,13 +583,12 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
     *,
     callable_obj,
     sub_ids,
-    primary_device_id,
-    is_hardware,
     rounds,
     skip_golden,
     enable_l2_swimlane,
     enable_dump_tensor,
     enable_pmu,
+    enable_dep_gen,
 ):
     """Execute a pre-filtered list of cases for one class (layers 5-6).
 
@@ -638,13 +598,12 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
     """
     cls_name = type(cls_inst).__name__
     callable_spec = getattr(type(cls_inst), "CALLABLE", None)
-    diagnostics_on = enable_l2_swimlane or enable_dump_tensor or enable_pmu
+    diagnostics_on = enable_l2_swimlane or enable_dump_tensor or enable_pmu or enable_dep_gen
     for case in cases:
         case_label = f"{cls_name}_{case['name']}"
         # Per-case directory the runtime writes into. Required (non-empty) when
         # any diagnostic flag is on; CallConfig::validate() throws otherwise.
         prefix = _build_output_prefix(case_label) if diagnostics_on else Path("")
-        before_device = _snapshot_device_logs(primary_device_id) if enable_l2_swimlane and is_hardware else None
         try:
             cls_inst._run_and_validate(
                 worker,
@@ -656,17 +615,12 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
                 enable_l2_swimlane=enable_l2_swimlane,
                 enable_dump_tensor=enable_dump_tensor,
                 enable_pmu=enable_pmu,
+                enable_dep_gen=enable_dep_gen,
                 output_prefix=str(prefix) if diagnostics_on else "",
             )
         finally:
             if enable_l2_swimlane:
-                _convert_case_swimlane(
-                    case_label,
-                    prefix,
-                    primary_device_id,
-                    before_device,
-                    callable_spec=callable_spec,
-                )
+                _convert_case_swimlane(case_label, prefix, callable_spec=callable_spec)
 
 
 def _compare_outputs(test_args, golden_args, output_names, rtol, atol):
@@ -797,24 +751,18 @@ class SceneTestCase:
     # ------------------------------------------------------------------
 
     @classmethod
-    def _get_binaries(cls, platform, build=False):
-        from .runtime_builder import RuntimeBuilder  # noqa: PLC0415
-
-        return RuntimeBuilder(platform=platform).get_binaries(cls._st_runtime, build=build)
-
-    @classmethod
     def _create_worker(cls, platform, device_id=0, build=False):
-        from simpler.task_interface import ChipWorker  # noqa: PLC0415
+        """Create the L2 Worker for the standalone path.
 
-        bins = cls._get_binaries(platform, build=build)
-        w = ChipWorker()
-        w.init(
-            str(bins.host_path),
-            str(bins.aicpu_path),
-            str(bins.aicore_path),
-            str(bins.sim_context_path) if bins.sim_context_path else "",
-        )
-        w.set_device(device_id)
+        Mirrors the ``st_worker`` pytest fixture, which yields a ``Worker``
+        (not a raw ``ChipWorker``) — ``_run_and_validate_l2`` is shared by both
+        paths and calls ``worker.register(...)`` / ``worker.run(cid, ...)``,
+        which only the ``Worker`` wrapper exposes.
+        """
+        from simpler.worker import Worker  # noqa: PLC0415
+
+        w = Worker(level=2, device_id=device_id, platform=platform, runtime=cls._st_runtime, build=build)
+        w.init()
         return w
 
     # ------------------------------------------------------------------
@@ -834,7 +782,14 @@ class SceneTestCase:
         raise ValueError(f"Unsupported level: {self._st_level}")
 
     def _build_config(
-        self, config_dict, enable_l2_swimlane=False, enable_dump_tensor=False, enable_pmu=0, *, output_prefix=""
+        self,
+        config_dict,
+        enable_l2_swimlane=False,
+        enable_dump_tensor=False,
+        enable_pmu=0,
+        enable_dep_gen=False,
+        *,
+        output_prefix="",
     ):
         from simpler.task_interface import CallConfig  # noqa: PLC0415
 
@@ -844,6 +799,7 @@ class SceneTestCase:
         config.enable_l2_swimlane = enable_l2_swimlane
         config.enable_dump_tensor = enable_dump_tensor
         config.enable_pmu = enable_pmu  # 0=disabled, >0=enabled with event type
+        config.enable_dep_gen = enable_dep_gen
         # `output_prefix` is required by CallConfig::validate() whenever any
         # diagnostic flag is enabled. Caller threads it down from the per-case
         # directory built by _build_output_prefix().
@@ -868,7 +824,7 @@ class SceneTestCase:
     # Run + validate
     # ------------------------------------------------------------------
 
-    def _run_and_validate(
+    def _run_and_validate(  # noqa: PLR0913 -- threads CLI diagnostic flags + case context
         self,
         worker,
         callable_obj,
@@ -879,6 +835,7 @@ class SceneTestCase:
         enable_l2_swimlane=False,
         enable_dump_tensor=False,
         enable_pmu=0,
+        enable_dep_gen=False,
         output_prefix="",
     ):
         if self._st_level == 2:
@@ -891,6 +848,7 @@ class SceneTestCase:
                 enable_l2_swimlane=enable_l2_swimlane,
                 enable_dump_tensor=enable_dump_tensor,
                 enable_pmu=enable_pmu,
+                enable_dep_gen=enable_dep_gen,
                 output_prefix=output_prefix,
             )
         elif self._st_level == 3:
@@ -904,6 +862,7 @@ class SceneTestCase:
                 enable_l2_swimlane=enable_l2_swimlane,
                 enable_dump_tensor=enable_dump_tensor,
                 enable_pmu=enable_pmu,
+                enable_dep_gen=enable_dep_gen,
                 output_prefix=output_prefix,
             )
 
@@ -917,11 +876,21 @@ class SceneTestCase:
         enable_l2_swimlane=False,
         enable_dump_tensor=False,
         enable_pmu=0,
+        enable_dep_gen=False,
         output_prefix="",
     ):
         params = case.get("params", {})
         config_dict = case.get("config", {})
         orch_sig = self.CALLABLE.get("orchestration", {}).get("signature", [])
+
+        # The L2 entry point is `Worker.run(cid, args, cfg)`.  Reuse the
+        # cid registered by the st_worker fixture / standalone path.  For
+        # first-time callers (worker reused across rounds), `_st_l2_cid`
+        # caches the cid so subsequent runs skip re-registration.
+        cid = getattr(type(self), "_st_l2_cid", None)
+        if cid is None:
+            cid = worker.register(callable_obj)
+            type(self)._st_l2_cid = cid
 
         # Build args
         test_args = self.generate_args(params)
@@ -950,16 +919,17 @@ class SceneTestCase:
                 enable_l2_swimlane=(enable_l2_swimlane and round_idx == 0),
                 enable_dump_tensor=enable_dump_tensor,
                 enable_pmu=enable_pmu,
+                enable_dep_gen=(enable_dep_gen and round_idx == 0),
                 output_prefix=output_prefix,
             )
 
             with _temporary_env(self._resolve_env()):
-                worker.run(callable_obj, chip_args, config=config)
+                worker.run(cid, chip_args, config=config)
 
             if not skip_golden:
                 _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
-    def _run_and_validate_l3(
+    def _run_and_validate_l3(  # noqa: PLR0913 -- threads CLI diagnostic flags + L3 ns context
         self,
         worker,
         compiled_callables,
@@ -970,6 +940,7 @@ class SceneTestCase:
         enable_l2_swimlane=False,
         enable_dump_tensor=False,
         enable_pmu=0,
+        enable_dep_gen=False,
         output_prefix="",
     ):
         # Defensive belt-and-braces: the pytest dispatcher and run_module both
@@ -1020,6 +991,7 @@ class SceneTestCase:
                 enable_l2_swimlane=(enable_l2_swimlane and round_idx == 0),
                 enable_dump_tensor=enable_dump_tensor,
                 enable_pmu=enable_pmu,
+                enable_dep_gen=(enable_dep_gen and round_idx == 0),
                 output_prefix=output_prefix,
             )
 
@@ -1038,6 +1010,23 @@ class SceneTestCase:
     # pytest auto test method
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _effective_enable_dep_gen(request, *, warn: bool = False) -> bool:
+        """``--enable-dep-gen`` CLI value after applying the ``--rounds > 1``
+        disable. Single source of truth so the framework's ``test_run`` loop
+        and any subclass override (e.g. ``TestDepGenCapture``'s post-validate
+        hook) can't drift on the gating rule. Pass ``warn=True`` from the
+        framework's first call — it owns the user-facing "disabled because
+        rounds > 1" message; subclass overrides leave ``warn`` off since
+        ``super().test_run()`` already warned."""
+        if not request.config.getoption("--enable-dep-gen", default=False):
+            return False
+        if request.config.getoption("--rounds", default=1) > 1:
+            if warn:
+                logger.warning("dep_gen disabled: --rounds > 1")
+            return False
+        return True
+
     def test_run(self, st_platform, st_worker, request):
         """Auto test method — runs matching cases for the current platform."""
         raw_selectors = request.config.getoption("--case", default=None) or []
@@ -1048,6 +1037,7 @@ class SceneTestCase:
         enable_l2_swimlane = request.config.getoption("--enable-l2-swimlane", default=False)
         enable_dump_tensor = request.config.getoption("--dump-tensor", default=False)
         enable_pmu = request.config.getoption("--enable-pmu", default=0)
+        enable_dep_gen = self._effective_enable_dep_gen(request, warn=True)
         if rounds > 1:
             if enable_l2_swimlane:
                 logger.warning("Profiling disabled: --rounds > 1")
@@ -1062,15 +1052,11 @@ class SceneTestCase:
         cls_name = type(self).__name__
         callable_obj = self.build_callable(st_platform)
         sub_ids = getattr(type(self), "_st_sub_ids", {})
-
-        # Primary device id: prefer the one actually allocated by st_worker
-        # (each test class can hold a different slot from DevicePool); fall back
-        # to the first id in --device if the fixture didn't stash it.
-        primary_device_id = getattr(st_worker, "_st_device_id", None)
-        if primary_device_id is None:
-            raw_device = request.config.getoption("--device", default="0")
-            primary_device_id = raw_device.split("-", 1)[0] if "-" in raw_device else raw_device
-        is_hardware = not st_platform.endswith("sim")
+        # For L3, use pre-registered chip cids instead of raw ChipCallable
+        # objects.
+        chip_cids = getattr(type(self), "_st_chip_cids", {})
+        if self._st_level == 3 and chip_cids:
+            callable_obj = {**chip_cids}
 
         matched = []
         for case in self.CASES:
@@ -1096,13 +1082,12 @@ class SceneTestCase:
             matched,
             callable_obj=callable_obj,
             sub_ids=sub_ids,
-            primary_device_id=primary_device_id,
-            is_hardware=is_hardware,
             rounds=rounds,
             skip_golden=skip_golden,
             enable_l2_swimlane=enable_l2_swimlane,
             enable_dump_tensor=enable_dump_tensor,
             enable_pmu=enable_pmu,
+            enable_dep_gen=enable_dep_gen,
         )
 
     # ------------------------------------------------------------------
@@ -1148,6 +1133,11 @@ class SceneTestCase:
             "--enable-l2-swimlane", action="store_true", help="Enable perf swimlane collection (first round only)"
         )
         parser.add_argument("--dump-tensor", action="store_true", help="Dump per-task tensor I/O at runtime")
+        parser.add_argument(
+            "--enable-dep-gen",
+            action="store_true",
+            help="Enable dep_gen capture (SubmitTrace ring, first round only)",
+        )
         parser.add_argument(
             "--enable-pmu",
             nargs="?",
@@ -1216,6 +1206,9 @@ class SceneTestCase:
         if args.rounds > 1 and args.enable_l2_swimlane:
             logger.warning("Profiling disabled: --rounds > 1")
             args.enable_l2_swimlane = False
+        if args.rounds > 1 and args.enable_dep_gen:
+            logger.warning("dep_gen disabled: --rounds > 1")
+            args.enable_dep_gen = False
 
         from .parallel_scheduler import default_max_parallel, device_range_to_list  # noqa: PLC0415
 
@@ -1313,23 +1306,22 @@ class SceneTestCase:
         for cls in selected_by_cls:
             by_rt_level.setdefault((cls._st_runtime, cls._st_level), []).append(cls)
 
-        is_hardware = not args.platform.endswith("sim")
-        if args.enable_l2_swimlane and is_hardware and "-d" not in sys.argv and "--device" not in sys.argv:
-            print(
-                f"WARNING: --enable-l2-swimlane on hardware platform '{args.platform}' without explicit "
-                "-d/--device; defaulting to device 0 may point scheduler deep-dive at the wrong log.",
-                file=sys.stderr,
-            )
-
         ok = True
         for (runtime, level), group in by_rt_level.items():
             print(f"\n=== Runtime: {runtime}  Level: {level} ===")
-            worker, per_class_sub_ids = _create_standalone_worker(group, level, args, selected_by_cls)
+            worker, per_class_sub_ids, per_class_chip_cids = _create_standalone_worker(
+                group, level, args, selected_by_cls
+            )
             try:
                 for cls in group:
                     inst = cls()
                     callable_obj = inst.build_callable(args.platform)
                     sub_ids = per_class_sub_ids.get(cls, {})
+                    chip_cids = per_class_chip_cids.get(cls, {})
+                    # For L3: merge chip cids into callable_obj (replacing
+                    # ChipCallable objects with their registered cid).
+                    if level == 3 and chip_cids:
+                        callable_obj = {**chip_cids}
                     for case in selected_by_cls[cls]:
                         label = f"{cls.__name__}::{case['name']}"
                         print(f"  {label} ... ", end="", flush=True)
@@ -1340,13 +1332,12 @@ class SceneTestCase:
                                 [case],
                                 callable_obj=callable_obj,
                                 sub_ids=sub_ids,
-                                primary_device_id=args.device,
-                                is_hardware=is_hardware,
                                 rounds=args.rounds,
                                 skip_golden=args.skip_golden,
                                 enable_l2_swimlane=args.enable_l2_swimlane,
                                 enable_dump_tensor=args.dump_tensor,
                                 enable_pmu=args.enable_pmu,
+                                enable_dep_gen=args.enable_dep_gen,
                             )
                             print("PASSED")
                         except Exception as e:  # noqa: BLE001
@@ -1355,10 +1346,7 @@ class SceneTestCase:
                             if args.exitfirst:
                                 raise SystemExit(1) from None
             finally:
-                if level == 2:
-                    worker.finalize()
-                else:
-                    worker.close()
+                worker.close()
 
         sys.exit(0 if ok else 1)
 
@@ -1387,6 +1375,8 @@ def _dispatch_test_phases_standalone(module_name, selected_by_cls, args):  # noq
         common.append("--enable-l2-swimlane")
     if args.dump_tensor:
         common.append("--dump-tensor")
+    if args.enable_dep_gen:
+        common.append("--enable-dep-gen")
     if args.build:
         common.append("--build")
 
@@ -1562,11 +1552,15 @@ def _create_standalone_worker(group, level, args, selected_by_cls):
     ``max_sub_workers`` must be computed from these, not from ``cls.CASES``:
     otherwise a manual case with a larger ``device_count`` inflates the
     allocation even when it isn't scheduled.
+
+    Returns ``(worker, per_class_sub_ids, per_class_chip_cids)`` for both
+    L2 and L3 so the caller can unpack uniformly. L2 has neither sub
+    callables nor pre-registered chip callables, so both dicts are empty.
     """
     first_cls = group[0]
     build = getattr(args, "build", False)
     if level == 2:
-        return first_cls._create_worker(args.platform, args.device, build=build), {}
+        return first_cls._create_worker(args.platform, args.device, build=build), {}, {}
 
     from simpler.worker import Worker  # noqa: PLC0415
 
@@ -1595,12 +1589,24 @@ def _create_standalone_worker(group, level, args, selected_by_cls):
     )
     # Register sub callables per-class to avoid name collisions
     per_class_sub_ids: dict[type, dict] = {}
+    # Also register ChipCallables here (before init) so the chip children
+    # pre-warm them via _CTRL_PREPARE.
+    per_class_chip_cids: dict[type, dict] = {}
     for cls in group:
         cls_sub_ids = {}
+        cls_chip_cids = {}
         for entry in cls.CALLABLE.get("callables", []):
             if "callable" in entry:
                 cid = worker.register(entry["callable"])
                 cls_sub_ids[entry["name"]] = cid
+            elif "orchestration" in entry:
+                name = entry["name"]
+                cache_key = (cls.__qualname__, name, args.platform, cls._st_runtime)
+                chip = _compile_chip_callable_from_spec(entry, args.platform, cls._st_runtime, cache_key)
+                cid = worker.register(chip)
+                cls_chip_cids[name] = cid
+                cls_chip_cids[f"{name}_sig"] = entry["orchestration"].get("signature", [])
         per_class_sub_ids[cls] = cls_sub_ids
+        per_class_chip_cids[cls] = cls_chip_cids
     worker.init()
-    return worker, per_class_sub_ids
+    return worker, per_class_sub_ids, per_class_chip_cids

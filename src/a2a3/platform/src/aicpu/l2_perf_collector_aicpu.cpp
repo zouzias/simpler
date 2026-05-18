@@ -35,6 +35,14 @@ static L2PerfDataHeader *s_l2_perf_header = nullptr;
 // Per-core L2PerfBufferState cache
 static L2PerfBufferState *s_perf_buffer_states[PLATFORM_MAX_CORES] = {};
 
+// Per-core L2PerfAicoreRing cache (stable for the run; AICPU reads, AICore writes)
+static L2PerfAicoreRing *s_perf_aicore_rings[PLATFORM_MAX_CORES] = {};
+
+// Per-core cached current-records-buffer pointer. Written by AICPU when
+// rotating buffers from inside `complete_record`; AICPU never publishes this
+// to AICore (AICore only sees the stable ring).
+static L2PerfBuffer *s_perf_records_buffers[PLATFORM_MAX_CORES] = {};
+
 // Per-thread PhaseBufferState cache
 static PhaseBufferState *s_phase_buffer_states[PLATFORM_MAX_AICPU_THREADS] = {};
 static PhaseBuffer *s_current_phase_buf[PLATFORM_MAX_AICPU_THREADS] = {};
@@ -87,7 +95,7 @@ static int enqueue_ready_buffer(
     return 0;
 }
 
-void l2_perf_aicpu_init_profiling(Runtime *runtime) {
+void l2_perf_aicpu_init(int worker_count) {
     void *l2_perf_base = reinterpret_cast<void *>(g_platform_l2_perf_base);
     if (l2_perf_base == nullptr) {
         LOG_ERROR("l2_perf_data_base is NULL, cannot initialize profiling");
@@ -96,17 +104,20 @@ void l2_perf_aicpu_init_profiling(Runtime *runtime) {
 
     s_l2_perf_header = get_l2_perf_header(l2_perf_base);
 
-    int32_t task_count = runtime->get_task_count();
-    s_l2_perf_header->total_tasks = static_cast<uint32_t>(task_count);
-
-    LOG_INFO_V0("Initializing performance profiling for %d cores (free queue)", runtime->worker_count);
+    LOG_INFO_V0("Initializing performance profiling for %d cores (free queue)", worker_count);
 
     // Pop first buffer from free_queue for each core
-    for (int i = 0; i < runtime->worker_count; i++) {
-        Handshake *h = &runtime->workers[i];
+    for (int i = 0; i < worker_count; i++) {
         L2PerfBufferState *state = get_perf_buffer_state(l2_perf_base, i);
 
         s_perf_buffer_states[i] = state;
+
+        // Cache the per-core staging ring (host populated state->aicore_ring_ptr
+        // before the AICPU started). AICore receives the same per-core ring via
+        // KernelArgs::aicore_ring_addr + set_aicore_l2_perf_ring() — no
+        // handshake hop, so this routine doesn't republish anything.
+        L2PerfAicoreRing *ring = reinterpret_cast<L2PerfAicoreRing *>(state->aicore_ring_ptr);
+        s_perf_aicore_rings[i] = ring;
 
         // Pop first buffer from free_queue
         rmb();
@@ -123,40 +134,139 @@ void l2_perf_aicpu_init_profiling(Runtime *runtime) {
 
             L2PerfBuffer *buf = reinterpret_cast<L2PerfBuffer *>(buf_ptr);
             buf->count = 0;
-            h->l2_perf_records_addr = buf_ptr;
+            s_perf_records_buffers[i] = buf;
 
             LOG_DEBUG("Core %d: popped initial buffer (addr=0x%lx)", i, buf_ptr);
         } else {
             LOG_ERROR("Core %d: free_queue is empty during init!", i);
             state->current_buf_ptr = 0;
-            h->l2_perf_records_addr = 0;
+            s_perf_records_buffers[i] = nullptr;
         }
     }
 
     wmb();
 
-    LOG_INFO_V0("Performance profiling initialized for %d cores", runtime->worker_count);
+    LOG_INFO_V0("Performance profiling initialized for %d cores", worker_count);
+}
+
+/**
+ * Internal records-buffer rotation. Called from `l2_perf_aicpu_complete_record`
+ * after a record is committed and the buffer hits capacity. Only swaps an
+ * AICPU-private records pointer — AICore reads from a stable ring and is
+ * unaffected by this call.
+ */
+static void switch_records_buffer(int core_id, int thread_idx) {
+    L2PerfBufferState *state = s_perf_buffer_states[core_id];
+    if (state == nullptr) {
+        return;
+    }
+
+    L2PerfBuffer *full_buf = s_perf_records_buffers[core_id];
+    if (full_buf == nullptr) {
+        return;
+    }
+
+    LOG_INFO_V0("Thread %d: Core %d buffer is full (count=%u)", thread_idx, core_id, full_buf->count);
+
+    // Check free_queue before committing the full buffer
+    rmb();
+    uint32_t head = state->free_queue.head;
+    uint32_t tail = state->free_queue.tail;
+
+    if (head == tail) {
+        // No replacement buffer available — overwrite current buffer to keep AICore alive
+        LOG_WARN("Thread %d: Core %d no free buffer, overwriting current buffer (data lost)", thread_idx, core_id);
+        state->dropped_record_count = state->dropped_record_count + full_buf->count;
+        full_buf->count = 0;
+        wmb();
+        return;
+    }
+
+    // Enqueue full buffer to ReadyQueue
+    uint32_t seq = state->current_buf_seq;
+    int rc = enqueue_ready_buffer(s_l2_perf_header, thread_idx, core_id, state->current_buf_ptr, seq, 0);
+    if (rc != 0) {
+        LOG_ERROR("Thread %d: Core %d failed to enqueue buffer (queue full), data lost!", thread_idx, core_id);
+        // Revert: discard data and keep writing
+        state->dropped_record_count = state->dropped_record_count + full_buf->count;
+        full_buf->count = 0;
+        wmb();
+        return;
+    }
+
+    // Pop next buffer from free_queue
+    uint64_t new_buf_ptr = state->free_queue.buffer_ptrs[head % PLATFORM_PROF_SLOT_COUNT];
+    rmb();
+    state->free_queue.head = head + 1;
+    state->current_buf_ptr = new_buf_ptr;
+    state->current_buf_seq = seq + 1;
+    wmb();
+
+    L2PerfBuffer *new_buf = reinterpret_cast<L2PerfBuffer *>(new_buf_ptr);
+    new_buf->count = 0;
+    s_perf_records_buffers[core_id] = new_buf;
+
+    LOG_INFO_V0("Thread %d: Core %d switched to new buffer (addr=0x%lx)", thread_idx, core_id, new_buf_ptr);
 }
 
 int l2_perf_aicpu_complete_record(
-    L2PerfBuffer *l2_perf_buf, uint32_t expected_reg_task_id, uint64_t task_id, uint32_t func_id, CoreType core_type,
+    int core_id, int thread_idx, uint32_t expected_reg_task_id, uint64_t task_id, uint32_t func_id, CoreType core_type,
     uint64_t dispatch_time, uint64_t finish_time, const uint64_t *fanout, int32_t fanout_count
 ) {
-    rmb();
-    uint32_t count = l2_perf_buf->count;
-    if (count >= PLATFORM_PROF_BUFFER_SIZE) return -1;
+    if (core_id < 0 || core_id >= PLATFORM_MAX_CORES) {
+        return -1;
+    }
+    L2PerfBufferState *state = s_perf_buffer_states[core_id];
+    if (state == nullptr) {
+        return -1;
+    }
+    L2PerfAicoreRing *ring = s_perf_aicore_rings[core_id];
+    if (ring == nullptr) {
+        return -1;
+    }
 
-    // Read from WIP staging slot (AICore writes here, parity = reg_task_id & 1)
-    L2PerfRecord *wip = &l2_perf_buf->wip[expected_reg_task_id & 1u];
+    // Account every commit attempt up front so host can detect silent loss as
+    // `device_total - (collected + dropped + mismatch)`.
+    state->total_record_count += 1;
+
+    L2PerfBuffer *l2_perf_buf = s_perf_records_buffers[core_id];
+    if (l2_perf_buf == nullptr) {
+        // No active records buffer (init ran out of free buffers); count as drop
+        // so host reconciliation stays consistent.
+        state->dropped_record_count += 1;
+        return -1;
+    }
+    uint32_t count = l2_perf_buf->count;
+    if (count >= PLATFORM_PROF_BUFFER_SIZE) {
+        // Defensive: should not happen because we rotate at end of every commit.
+        state->dropped_record_count += 1;
+        return -1;
+    }
+
+    // Read AICore-published timing from the per-core staging ring.
+    L2PerfRecord *slot = &ring->dual_issue_slots[expected_reg_task_id % PLATFORM_L2_AICORE_RING_SIZE];
     // One PoC cache line: matches AICore l2_perf_aicore_record_task() dcci(..., SINGLE_CACHE_LINE, ...)
-    // and aicpu/cache_ops.cpp step size; wip timing fields live in the first line.
-    cache_invalidate_range(wip, 64);
-    if (static_cast<uint32_t>(wip->task_id) != expected_reg_task_id) return -1;
+    // and aicpu/cache_ops.cpp step size; timing fields live in the first line.
+    cache_invalidate_range(slot, 64);
+    if (static_cast<uint32_t>(slot->task_id) != expected_reg_task_id) {
+        // Hard error: the runtime's completion-before-dispatch invariant
+        // guarantees AICore must have published this slot before AICPU sees
+        // FIN. A mismatch means the invariant is broken (e.g. in-flight
+        // depth exceeded PLATFORM_L2_AICORE_RING_SIZE, or AICore failed to
+        // dcci before signaling). Surface separately from capacity drops.
+        state->mismatch_record_count += 1;
+        LOG_ERROR(
+            "L2Perf invariant violated: core %d slot task_id=0x%x expected=0x%x "
+            "(completion-before-dispatch broken or ring undersized)",
+            core_id, static_cast<uint32_t>(slot->task_id), expected_reg_task_id
+        );
+        return -1;
+    }
 
     // Copy AICore timing to committed record slot
     L2PerfRecord *record = &l2_perf_buf->records[count];
-    record->start_time = wip->start_time;
-    record->end_time = wip->end_time;
+    record->start_time = slot->start_time;
+    record->end_time = slot->end_time;
 
     // Fill AICPU-owned fields
     record->task_id = task_id;
@@ -175,70 +285,17 @@ int l2_perf_aicpu_complete_record(
         record->fanout_count = 0;
     }
 
-    l2_perf_buf->count = count + 1;
+    uint32_t new_count = count + 1;
+    l2_perf_buf->count = new_count;
     wmb();
+
+    // Rotate after the write so the just-committed record is preserved.
+    // The ring is stable, so AICore is unaffected by this swap.
+    if (new_count >= PLATFORM_PROF_BUFFER_SIZE) {
+        switch_records_buffer(core_id, thread_idx);
+    }
+
     return 0;
-}
-
-void l2_perf_aicpu_switch_buffer(Runtime *runtime, int core_id, int thread_idx) {
-    void *l2_perf_base = reinterpret_cast<void *>(g_platform_l2_perf_base);
-    if (l2_perf_base == nullptr) {
-        return;
-    }
-
-    L2PerfBufferState *state = s_perf_buffer_states[core_id];
-    if (state == nullptr) {
-        return;
-    }
-
-    L2PerfBuffer *full_buf = reinterpret_cast<L2PerfBuffer *>(state->current_buf_ptr);
-    if (full_buf == nullptr) {
-        return;
-    }
-
-    LOG_INFO_V0("Thread %d: Core %d buffer is full (count=%u)", thread_idx, core_id, full_buf->count);
-
-    // Check free_queue before committing the full buffer
-    rmb();
-    uint32_t head = state->free_queue.head;
-    uint32_t tail = state->free_queue.tail;
-
-    if (head == tail) {
-        // No replacement buffer available — overwrite current buffer to keep AICore alive
-        LOG_WARN("Thread %d: Core %d no free buffer, overwriting current buffer (data lost)", thread_idx, core_id);
-        full_buf->count = 0;
-        wmb();
-        return;
-    }
-
-    // Enqueue full buffer to ReadyQueue
-    uint32_t seq = state->current_buf_seq;
-    int rc = enqueue_ready_buffer(s_l2_perf_header, thread_idx, core_id, state->current_buf_ptr, seq, 0);
-    if (rc != 0) {
-        LOG_ERROR("Thread %d: Core %d failed to enqueue buffer (queue full), data lost!", thread_idx, core_id);
-        // Revert: discard data and keep writing
-        full_buf->count = 0;
-        wmb();
-        return;
-    }
-
-    // Pop next buffer from free_queue
-    uint64_t new_buf_ptr = state->free_queue.buffer_ptrs[head % PLATFORM_PROF_SLOT_COUNT];
-    rmb();
-    state->free_queue.head = head + 1;
-    state->current_buf_ptr = new_buf_ptr;
-    state->current_buf_seq = seq + 1;
-    wmb();
-
-    L2PerfBuffer *new_buf = reinterpret_cast<L2PerfBuffer *>(new_buf_ptr);
-    new_buf->count = 0;
-
-    // Update handshake for AICore
-    Handshake *h = &runtime->workers[core_id];
-    h->l2_perf_records_addr = new_buf_ptr;
-    wmb();
-
-    LOG_INFO_V0("Thread %d: Core %d switched to new buffer (addr=0x%lx)", thread_idx, core_id, new_buf_ptr);
 }
 
 void l2_perf_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, int core_num) {
@@ -280,9 +337,21 @@ void l2_perf_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, in
             LOG_INFO_V0("Thread %d: Core %d flushed buffer with %u records", thread_idx, core_id, buf->count);
             flushed_count++;
             state->current_buf_ptr = 0;
+            s_perf_records_buffers[core_id] = nullptr;
             wmb();
         } else {
-            LOG_ERROR("Thread %d: Core %d failed to enqueue buffer (queue full), data lost!", thread_idx, core_id);
+            // ready_queue full at end-of-run: account the loss and clear the
+            // buffer so host reconcile sees a clean state (current_buf_ptr=0)
+            // and dropped == flush failures rather than ring/task_id mismatch.
+            LOG_ERROR(
+                "Thread %d: Core %d failed to enqueue buffer (queue full), %u records lost!", thread_idx, core_id,
+                buf->count
+            );
+            state->dropped_record_count = state->dropped_record_count + buf->count;
+            buf->count = 0;
+            state->current_buf_ptr = 0;
+            s_perf_records_buffers[core_id] = nullptr;
+            wmb();
         }
     }
 
@@ -291,25 +360,14 @@ void l2_perf_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, in
     LOG_INFO_V0("Thread %d: Performance buffer flush complete, %d buffers flushed", thread_idx, flushed_count);
 }
 
-void l2_perf_aicpu_update_total_tasks(uint32_t total_tasks) {
-    void *l2_perf_base = reinterpret_cast<void *>(g_platform_l2_perf_base);
-    if (l2_perf_base == nullptr) {
-        return;
-    }
-
-    L2PerfDataHeader *header = get_l2_perf_header(l2_perf_base);
-    header->total_tasks = total_tasks;
-    wmb();
-}
-
-void l2_perf_aicpu_init_phase_profiling(Runtime *runtime, int num_sched_threads) {
+void l2_perf_aicpu_init_phase(int worker_count, int num_sched_threads) {
     void *l2_perf_base = reinterpret_cast<void *>(g_platform_l2_perf_base);
     if (l2_perf_base == nullptr) {
         LOG_ERROR("l2_perf_data_base is NULL, cannot initialize phase profiling");
         return;
     }
 
-    s_phase_header = get_phase_header(l2_perf_base, runtime->worker_count);
+    s_phase_header = get_phase_header(l2_perf_base, worker_count);
     s_l2_perf_header = get_l2_perf_header(l2_perf_base);
 
     s_phase_header->magic = AICPU_PHASE_MAGIC;
@@ -327,7 +385,7 @@ void l2_perf_aicpu_init_phase_profiling(Runtime *runtime, int num_sched_threads)
         total_threads = PLATFORM_MAX_AICPU_THREADS;
     }
     for (int t = 0; t < total_threads; t++) {
-        PhaseBufferState *state = get_phase_buffer_state(l2_perf_base, runtime->worker_count, t);
+        PhaseBufferState *state = get_phase_buffer_state(l2_perf_base, worker_count, t);
 
         s_phase_buffer_states[t] = state;
 
@@ -390,8 +448,13 @@ static void switch_phase_buffer(int thread_idx) {
     uint32_t seq = state->current_buf_seq;
     int rc = enqueue_ready_buffer(s_l2_perf_header, thread_idx, thread_idx, state->current_buf_ptr, seq, 1);
     if (rc != 0) {
-        LOG_ERROR("Thread %d: failed to enqueue phase buffer (queue full), discarding data", thread_idx);
+        LOG_ERROR(
+            "Thread %d: failed to enqueue phase buffer (queue full), %u records lost!", thread_idx, full_buf->count
+        );
+        state->dropped_record_count = state->dropped_record_count + full_buf->count;
         full_buf->count = 0;
+        s_current_phase_buf[thread_idx] = nullptr;
+        state->current_buf_ptr = 0;
         wmb();
         return;
     }
@@ -425,19 +488,25 @@ static void switch_phase_buffer(int thread_idx) {
 
 void l2_perf_aicpu_record_phase(
     int thread_idx, AicpuPhaseId phase_id, uint64_t start_time, uint64_t end_time, uint32_t loop_iter,
-    uint64_t tasks_processed
+    uint64_t tasks_processed, uint32_t extra1, uint32_t extra2
 ) {
     if (s_phase_header == nullptr) {
         return;
     }
 
+    PhaseBufferState *state = s_phase_buffer_states[thread_idx];
+    if (state == nullptr) {
+        return;
+    }
+
+    // Account every commit attempt up front so host can detect silent loss
+    // as `device_total - (collected + dropped)` (mirrors PERF accounting).
+    state->total_record_count += 1;
+
     PhaseBuffer *buf = s_current_phase_buf[thread_idx];
 
     // Try to recover from nullptr (no buffer was available on previous switch)
     if (buf == nullptr) {
-        PhaseBufferState *state = s_phase_buffer_states[thread_idx];
-        if (state == nullptr) return;
-
         rmb();
         uint32_t head = state->free_queue.head;
         uint32_t tail = state->free_queue.tail;
@@ -456,7 +525,10 @@ void l2_perf_aicpu_record_phase(
 
             LOG_INFO_V0("Thread %d: recovered phase buffer", thread_idx);
         }
-        if (buf == nullptr) return;  // Still no buffer available
+        if (buf == nullptr) {
+            state->dropped_record_count += 1;
+            return;
+        }
     }
 
     uint32_t idx = buf->count;
@@ -465,10 +537,14 @@ void l2_perf_aicpu_record_phase(
         // Buffer full, switch to next buffer
         switch_phase_buffer(thread_idx);
         buf = s_current_phase_buf[thread_idx];
-        if (buf == nullptr) return;  // No buffer available
+        if (buf == nullptr) {
+            state->dropped_record_count += 1;
+            return;
+        }
         idx = buf->count;
         if (idx >= PLATFORM_PHASE_RECORDS_PER_THREAD) {
-            return;  // Switch failed; drop this record
+            state->dropped_record_count += 1;
+            return;
         }
     }
 
@@ -478,6 +554,8 @@ void l2_perf_aicpu_record_phase(
     record->loop_iter = loop_iter;
     record->phase_id = phase_id;
     record->task_id = tasks_processed;
+    record->extra1 = extra1;
+    record->extra2 = extra2;
 
     buf->count = idx + 1;
 }
@@ -534,13 +612,13 @@ void l2_perf_aicpu_flush_phase_buffers(int thread_idx) {
     int rc = enqueue_ready_buffer(s_l2_perf_header, thread_idx, thread_idx, buf_ptr, seq, 1);
     if (rc == 0) {
         LOG_INFO_V0("Thread %d: flushed phase buffer with %u records", thread_idx, buf->count);
-        state->current_buf_ptr = 0;
-        s_current_phase_buf[thread_idx] = nullptr;
-        wmb();
     } else {
-        LOG_ERROR("Thread %d: failed to enqueue phase buffer (queue full), data lost!", thread_idx);
+        LOG_ERROR("Thread %d: failed to enqueue phase buffer (queue full), %u records lost!", thread_idx, buf->count);
+        state->dropped_record_count = state->dropped_record_count + buf->count;
+        buf->count = 0;
     }
-
+    state->current_buf_ptr = 0;
+    s_current_phase_buf[thread_idx] = nullptr;
     wmb();
 }
 

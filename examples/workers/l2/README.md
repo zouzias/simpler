@@ -23,11 +23,18 @@ worker = Worker(
 )
 worker.init()             # load host.so + aicpu.so + aicore.o, set device
 try:
-    # ... allocate device buffers, build ChipCallable, run ...
-    worker.run(chip_callable, task_args, call_config)
+    # ... allocate device buffers, build ChipCallable ...
+    cid = worker.register(chip_callable)   # one-shot: cid is reused across runs
+    worker.run(cid, task_args, call_config)
 finally:
     worker.close()        # release ACL resources and device
 ```
+
+`register()` is the only way to obtain a `cid`; `worker.run` always takes
+that int, never the raw `ChipCallable`. A cid stays valid for the
+lifetime of the worker, so you register once and reuse it across runs —
+this is also why ST cases cache the cid on the test class (see
+`_st_l2_cid` in `simpler_setup/scene_test.py`).
 
 The `try/finally` is important — if anything between `init()` and `close()`
 raises, you still want the device released. The
@@ -40,6 +47,7 @@ the next job.
 | Directory | New concept | Runnable on |
 | --------- | ----------- | ----------- |
 | [`hello_worker/`](hello_worker/) | `Worker.init()` / `close()` contract, venv + build prereqs. No kernels. | `a2a3sim`, `a5sim` |
+| [`worker_malloc/`](worker_malloc/) | Standalone exercise of `malloc` / `copy_to` / `copy_from` / `free` with byte-exact round-trip — no `worker.run()`, the focused regression check for the per-thread device-bind path. | `a2a3sim`, `a2a3`, `a5sim`, `a5` |
 | [`vector_add/`](vector_add/) | Compile one AIV kernel → `ChipCallable`. Build `TaskArgs` with host→device buffer copy, run, copy back, compare against numpy. | `a2a3sim`, `a2a3` |
 
 Both examples use the same `main.py` shape:

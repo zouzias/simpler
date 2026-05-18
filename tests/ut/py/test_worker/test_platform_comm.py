@@ -12,7 +12,7 @@
 This is the Python twin of tests/ut/cpp/test_hccl_comm.cpp.  It drives the
 full comm lifecycle entirely through ChipWorker's public Python API:
 
-    ChipWorker.init → set_device → comm_init → comm_alloc_windows
+    ChipWorker.init(device_id) → comm_init → comm_alloc_windows
     → comm_get_local_window_base → comm_get_window_size
     → copy_from (reads back CommContext) → comm_barrier (known-issue tolerant)
     → comm_destroy → finalize
@@ -74,10 +74,7 @@ def _rank_entry(
     rank: int,
     nranks: int,
     device_id: int,
-    host_lib: str,
-    aicpu_path: str,
-    aicore_path: str,
-    sim_context_path: str,
+    bins,
     rootinfo_path: str,
     result_queue: mp.Queue,  # type: ignore[type-arg]
 ) -> None:
@@ -87,11 +84,8 @@ def _rank_entry(
         from simpler.task_interface import ChipWorker
 
         worker = ChipWorker()
-        worker.init(host_lib, aicpu_path, aicore_path, sim_context_path)
+        worker.init(device_id, bins)
         result["stage"] = "init"
-
-        worker.set_device(device_id)
-        result["stage"] = "set_device"
 
         # ChipWorker.comm_init owns ACL bring-up and aclrtStream creation
         # internally — Python never touches aclInit / aclrtSetDevice /
@@ -180,11 +174,6 @@ def test_two_rank_comm_lifecycle(st_device_ids):
 
     build = bool(os.environ.get("PTO_UT_BUILD"))
     bins = RuntimeBuilder(platform="a2a3").get_binaries("tensormap_and_ringbuffer", build=build)
-    host_lib = str(bins.host_path)
-    aicpu_path = str(bins.aicpu_path)
-    aicore_path = str(bins.aicore_path)
-    sim_context_path = str(bins.sim_context_path) if bins.sim_context_path else ""
-
     assert len(st_device_ids) >= 2, "device_count(2) fixture must yield >= 2 ids"
     nranks = 2
     rootinfo_path = f"/tmp/pto_comm_py_ut_rootinfo_{os.getpid()}.bin"
@@ -199,10 +188,7 @@ def test_two_rank_comm_lifecycle(st_device_ids):
                 rank,
                 nranks,
                 int(st_device_ids[rank]),
-                host_lib,
-                aicpu_path,
-                aicore_path,
-                sim_context_path,
+                bins,
                 rootinfo_path,
                 result_queue,
             ),

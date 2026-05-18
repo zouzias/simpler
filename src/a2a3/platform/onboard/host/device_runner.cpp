@@ -17,6 +17,8 @@
 
 #include "device_runner.h"
 
+#include "host_log.h"
+
 #include <dlfcn.h>
 
 #include <cassert>
@@ -28,9 +30,27 @@
 // Include HAL constants from CANN (header only, library loaded dynamically)
 #include "ascend_hal.h"
 #include "callable.h"
+#include "callable_protocol.h"
+#include "chip_callable_layout.h"
 #include "utils/elf_build_id.h"
 #include "host/host_regs.h"  // Register address retrieval
 #include "host/raii_scope_guard.h"
+
+// dep_gen_replay_emit_deps_json: strong symbol provided by
+// runtime/tensormap_and_ringbuffer/host/dep_gen_replay.cpp when that runtime is
+// linked into host_runtime.so. host_build_graph has no replay implementation
+// today, so its host_runtime.so falls through to this weak stub. visibility=
+// hidden keeps the stub off the global dynamic symbol table so it can't
+// accidentally shadow the strong symbol via RTLD_GLOBAL.
+// LOG_DEBUG (not WARN): runtimes that don't link dep_gen never enable it in
+// practice, so this path is unreachable for end users — the symbol exists
+// purely to keep the .so loadable.
+extern "C" __attribute__((weak, visibility("hidden"))) int dep_gen_replay_emit_deps_json(
+    const struct DepGenRecord * /*records*/, size_t /*num_records*/, const char * /*deps_json_path*/
+) {
+    LOG_DEBUG("dep_gen replay not implemented for this runtime — deps.json skipped");
+    return -1;
+}
 
 // =============================================================================
 // Lazy-loaded HAL (ascend_hal) for profiling host-register only
@@ -235,17 +255,16 @@ std::thread DeviceRunner::create_thread(std::function<void()> fn) {
     });
 }
 
-int DeviceRunner::ensure_device_initialized(
-    int device_id, const std::vector<uint8_t> &aicpu_so_binary, const std::vector<uint8_t> &aicore_kernel_binary
-) {
-    // First attach the current thread and create fresh run-scoped streams
-    int rc = prepare_run_context(device_id);
+int DeviceRunner::ensure_device_initialized() {
+    // First attach the current thread and create fresh run-scoped streams.
+    // device_id_ was set in attach_current_thread() during simpler_init.
+    int rc = prepare_run_context(device_id_);
     if (rc != 0) {
         return rc;
     }
 
     // Then ensure binaries are loaded
-    return ensure_binaries_loaded(aicpu_so_binary, aicore_kernel_binary);
+    return ensure_binaries_loaded();
 }
 
 int DeviceRunner::attach_current_thread(int device_id) {
@@ -268,8 +287,27 @@ int DeviceRunner::attach_current_thread(int device_id) {
         return rc;
     }
 
+    if (device_id_ == -1) {
+        configure_aicore_op_timeout();
+    }
+
     device_id_ = device_id;
     return 0;
+}
+
+void DeviceRunner::configure_aicore_op_timeout() {
+    uint64_t actual_timeout = 0;
+    int rc = aclrtSetOpExecuteTimeOutV2(PLATFORM_OP_EXECUTE_TIMEOUT_US, &actual_timeout);
+    if (rc != 0) {
+        LOG_ERROR(
+            "aclrtSetOpExecuteTimeOutV2(%llu us) failed: %d", (unsigned long long)PLATFORM_OP_EXECUTE_TIMEOUT_US, rc
+        );
+    } else {
+        LOG_INFO_V0(
+            "aclrtSetOpExecuteTimeOutV2: requested=%llu us, actual=%llu us",
+            (unsigned long long)PLATFORM_OP_EXECUTE_TIMEOUT_US, (unsigned long long)actual_timeout
+        );
+    }
 }
 
 int DeviceRunner::ensure_acl_ready(int device_id) {
@@ -375,15 +413,10 @@ void DeviceRunner::release_run_context() {
     }
 }
 
-int DeviceRunner::ensure_binaries_loaded(
-    const std::vector<uint8_t> &aicpu_so_binary, const std::vector<uint8_t> &aicore_kernel_binary
-) {
-    // Check if already loaded
+int DeviceRunner::ensure_binaries_loaded() {
+    // Check if already loaded (binaries are owned by the runner via
+    // set_executors and live for the runner's lifetime).
     if (binaries_loaded_) {
-        // Just update kernel binary if different
-        if (aicore_kernel_binary_ != aicore_kernel_binary) {
-            aicore_kernel_binary_ = aicore_kernel_binary;
-        }
         return 0;
     }
 
@@ -393,10 +426,8 @@ int DeviceRunner::ensure_binaries_loaded(
         return -1;
     }
 
-    aicore_kernel_binary_ = aicore_kernel_binary;
-
     // Load AICPU SO
-    int rc = so_info_.init(aicpu_so_binary, mem_alloc_);
+    int rc = so_info_.init(aicpu_so_binary_, mem_alloc_);
     if (rc != 0) {
         LOG_ERROR("AicpuSoInfo::init failed: %d", rc);
         return rc;
@@ -433,54 +464,59 @@ int DeviceRunner::copy_from_device(void *host_ptr, const void *dev_ptr, size_t b
     return rtMemcpy(host_ptr, bytes, dev_ptr, bytes, RT_MEMCPY_DEVICE_TO_HOST);
 }
 
-int DeviceRunner::run(
-    Runtime &runtime, int block_dim, int device_id, const std::vector<uint8_t> &aicpu_so_binary,
-    const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num
-) {
+int DeviceRunner::validate_block_dim(rtStream_t stream, int block_dim) {
+    if (block_dim < 1) {
+        LOG_ERROR("block_dim (%d) must be >= 1", block_dim);
+        return -1;
+    }
+
+    uint32_t cube_limit = 0, vector_limit = 0;
+    bool got_limits = (aclrtGetStreamResLimit(stream, ACL_RT_DEV_RES_CUBE_CORE, &cube_limit) == ACL_ERROR_NONE) &&
+                      (aclrtGetStreamResLimit(stream, ACL_RT_DEV_RES_VECTOR_CORE, &vector_limit) == ACL_ERROR_NONE) &&
+                      cube_limit > 0 && vector_limit > 0;
+
+    if (got_limits) {
+        int max_bd = static_cast<int>(
+            std::min(cube_limit / PLATFORM_AIC_CORES_PER_BLOCKDIM, vector_limit / PLATFORM_AIV_CORES_PER_BLOCKDIM)
+        );
+        if (block_dim > max_bd) {
+            LOG_ERROR(
+                "block_dim (%d) exceeds available cores (max_block_dim=%d, cube=%u, vector=%u)", block_dim, max_bd,
+                cube_limit, vector_limit
+            );
+            return -1;
+        }
+    } else if (block_dim > PLATFORM_MAX_BLOCKDIM) {
+        // aclrtGetStreamResLimit unavailable (or reported no cores) — fall back
+        // to the static platform capacity so block_dim stays bounded.
+        LOG_ERROR(
+            "aclrtGetStreamResLimit unavailable; block_dim (%d) exceeds static cap PLATFORM_MAX_BLOCKDIM (%d)",
+            block_dim, PLATFORM_MAX_BLOCKDIM
+        );
+        return -1;
+    }
+    return 0;
+}
+
+int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     // Validate launch_aicpu_num
     if (launch_aicpu_num < 1 || launch_aicpu_num > PLATFORM_MAX_AICPU_THREADS) {
         LOG_ERROR("launch_aicpu_num (%d) must be in range [1, %d]", launch_aicpu_num, PLATFORM_MAX_AICPU_THREADS);
         return -1;
     }
 
-    // Validate block_dim
-    if (block_dim < 1 || block_dim > PLATFORM_MAX_BLOCKDIM) {
-        LOG_ERROR("block_dim (%d) must be in range [1, %d]", block_dim, PLATFORM_MAX_BLOCKDIM);
-        return -1;
-    }
-
-    int scheduler_thread_num = runtime.get_orch_built_on_host() ? launch_aicpu_num : launch_aicpu_num - 1;
-
-    // Validate even core distribution for initial scheduler threads
-    if (scheduler_thread_num > 0) {
-        if (block_dim % scheduler_thread_num != 0) {
-            LOG_ERROR(
-                "block_dim (%d) not evenly divisible by scheduler_thread_num (%d)", block_dim, scheduler_thread_num
-            );
-            return -1;
-        }
-    } else {
-        LOG_INFO_V0(
-            "All %d threads are orchestrators, cores will be assigned after orchestration completes", launch_aicpu_num
-        );
-        // Post-transition: all threads become schedulers
-        if (block_dim % launch_aicpu_num != 0) {
-            LOG_WARN(
-                "block_dim (%d) not evenly divisible by aicpu_thread_num (%d), "
-                "some threads will have different core counts after transition",
-                block_dim, launch_aicpu_num
-            );
-        }
-    }
-
     // Ensure device is initialized (lazy initialization)
-    int rc = ensure_device_initialized(device_id, aicpu_so_binary, aicore_kernel_binary);
+    int rc = ensure_device_initialized();
     if (rc != 0) {
         LOG_ERROR("ensure_device_initialized failed: %d", rc);
         return rc;
     }
 
-    // Calculate execution parameters
+    // Validate block_dim against stream resource limits
+    rc = validate_block_dim(stream_aicore_, block_dim);
+    if (rc != 0) {
+        return rc;
+    }
     block_dim_ = block_dim;
 
     int num_aicore = block_dim * cores_per_blockdim_;
@@ -494,9 +530,26 @@ int DeviceRunner::run(
     worker_count_ = num_aicore;  // Store for print_handshake_results in destructor
     runtime.sche_cpu_num = launch_aicpu_num;
 
+    // Scope guards for register-address cleanup on all exit paths. Declared
+    // before the allocs so that an alloc-failure early-return still triggers
+    // cleanup of previously-allocated buffers (the predicates no-op on 0).
+    auto regs_cleanup = RAIIScopeGuard([this]() {
+        if (kernel_args_.args.regs != 0) {
+            mem_alloc_.free(reinterpret_cast<void *>(kernel_args_.args.regs));
+            kernel_args_.args.regs = 0;
+        }
+    });
+
+    auto pmu_regs_cleanup = RAIIScopeGuard([this]() {
+        if (kernel_args_.args.pmu_reg_addrs != 0) {
+            mem_alloc_.free(reinterpret_cast<void *>(kernel_args_.args.pmu_reg_addrs));
+            kernel_args_.args.pmu_reg_addrs = 0;
+        }
+    });
+
     // Get AICore register addresses for register-based task dispatch
     rc = init_aicore_register_addresses(
-        &kernel_args_.args.regs, static_cast<uint64_t>(device_id), mem_alloc_, AicoreRegKind::Ctrl
+        &kernel_args_.args.regs, static_cast<uint64_t>(device_id_), mem_alloc_, AicoreRegKind::Ctrl
     );
     if (rc != 0) {
         LOG_ERROR("init_aicore_register_addresses(Ctrl) failed: %d", rc);
@@ -504,15 +557,13 @@ int DeviceRunner::run(
     }
 
     // Get AICore PMU register addresses (distinct MMIO page from AIC_CTRL).
-    // Failure is non-fatal: PMU will be disabled if this query fails.
     if (enable_pmu_) {
-        int pmu_rc = init_aicore_register_addresses(
-            &kernel_args_.args.pmu_reg_addrs, static_cast<uint64_t>(device_id), mem_alloc_, AicoreRegKind::Pmu
+        rc = init_aicore_register_addresses(
+            &kernel_args_.args.pmu_reg_addrs, static_cast<uint64_t>(device_id_), mem_alloc_, AicoreRegKind::Pmu
         );
-        if (pmu_rc != 0) {
-            LOG_ERROR("init_aicore_register_addresses(Pmu) failed: %d, disabling PMU", pmu_rc);
-            kernel_args_.args.pmu_reg_addrs = 0;
-            enable_pmu_ = false;
+        if (rc != 0) {
+            LOG_ERROR("init_aicore_register_addresses(Pmu) failed: %d", rc);
+            return rc;
         }
     }
 
@@ -528,6 +579,10 @@ int DeviceRunner::run(
     if (enable_pmu_) {
         SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
     }
+    if (enable_dep_gen_) {
+        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DEP_GEN);
+    }
+    kernel_args_.args.enable_profiling_flag = enable_profiling_flag;
 
     for (int i = 0; i < num_aicore; i++) {
         runtime.workers[i].aicpu_ready = 0;
@@ -535,12 +590,12 @@ int DeviceRunner::run(
         runtime.workers[i].task = 0;
         // Set core type: first 1/3 are AIC, remaining 2/3 are AIV
         runtime.workers[i].core_type = (i < num_aic) ? CoreType::AIC : CoreType::AIV;
-        runtime.workers[i].enable_profiling_flag = enable_profiling_flag;
-        runtime.workers[i].l2_perf_records_addr = static_cast<uint64_t>(0);
     }
 
-    // Set function_bin_addr for all tasks: func_id_to_addr_[] stores CoreCallable
-    // device address; compute binary code address using compile-time offset
+    // Set function_bin_addr for all tasks: Runtime::func_id_to_addr_[] stores
+    // a CoreCallable device address; the binary code address is one
+    // compile-time offset further in. The dispatch path then reads
+    // resolved_addr_ from the on-device CoreCallable header.
     LOG_DEBUG("Setting function_bin_addr for Tasks");
     for (int i = 0; i < runtime.get_task_count(); i++) {
         Task *task = runtime.get_task(i);
@@ -552,65 +607,51 @@ int DeviceRunner::run(
     }
     LOG_DEBUG("");
 
-    // Scope guards for cleanup on all exit paths
-    auto regs_cleanup = RAIIScopeGuard([this]() {
-        if (kernel_args_.args.regs != 0) {
-            mem_alloc_.free(reinterpret_cast<void *>(kernel_args_.args.regs));
-            kernel_args_.args.regs = 0;
-        }
-    });
-
-    auto pmu_regs_cleanup = RAIIScopeGuard([this]() {
-        if (kernel_args_.args.pmu_reg_addrs != 0) {
-            mem_alloc_.free(reinterpret_cast<void *>(kernel_args_.args.pmu_reg_addrs));
-            kernel_args_.args.pmu_reg_addrs = 0;
-        }
-    });
-
     auto runtime_args_cleanup = RAIIScopeGuard([this]() {
         kernel_args_.finalize_device_kernel_args();
         kernel_args_.finalize_runtime_args();
     });
 
-    // Initialize performance profiling if enabled
+    // Initialize per-subsystem shared memory.
     if (enable_l2_swimlane_) {
-        rc = init_l2_perf_collection(num_aicore, device_id);
+        rc = init_l2_perf(num_aicore, device_id_);
         if (rc != 0) {
-            LOG_ERROR("init_l2_perf_collection failed: %d", rc);
+            LOG_ERROR("init_l2_perf failed: %d", rc);
             return rc;
         }
-        // Start memory management thread
-        l2_perf_collector_.start_memory_manager([this](std::function<void()> fn) {
-            return create_thread(std::move(fn));
-        });
     }
 
     if (enable_dump_tensor_) {
         // Initialize tensor dump (independent from profiling)
-        rc = init_tensor_dump(runtime, num_aicore, device_id);
+        rc = init_tensor_dump(runtime, device_id_);
         if (rc != 0) {
             LOG_ERROR("init_tensor_dump failed: %d", rc);
             return rc;
         }
-        dump_collector_.start_memory_manager();
     }
 
     if (enable_pmu_) {
-        rc = init_pmu_buffers(
-            num_aicore, launch_aicpu_num, make_pmu_csv_path(output_prefix_), pmu_event_type_, device_id
-        );
+        rc = init_pmu(num_aicore, launch_aicpu_num, make_pmu_csv_path(output_prefix_), pmu_event_type_, device_id_);
         if (rc != 0) {
-            LOG_ERROR("PMU init failed: %d, disabling PMU for this run", rc);
-            kernel_args_.args.pmu_data_base = 0;
-            enable_pmu_ = false;
+            LOG_ERROR("init_pmu failed: %d", rc);
+            return rc;
         }
     }
 
-    auto perf_cleanup = RAIIScopeGuard([this]() {
-        bool was_initialized = l2_perf_collector_.is_initialized();
-        if (was_initialized) {
-            l2_perf_collector_.stop_memory_manager();
+    if (enable_dep_gen_) {
+        rc = init_dep_gen(launch_aicpu_num, device_id_);
+        if (rc != 0) {
+            LOG_ERROR("init_dep_gen failed: %d", rc);
+            return rc;
         }
+    }
+
+    // On any exit from run() — success or early error — release the diagnostics
+    // collectors' shared memory. They are only re-initialized per run(), so a
+    // Worker reused across runs (e.g. a pytest session-scoped worker pool) would
+    // otherwise re-enter init_l2_perf() with stale state still allocated.
+    auto perf_cleanup = RAIIScopeGuard([this]() {
+        finalize_collectors();
     });
 
     LOG_INFO_V0("=== Initialize runtime args ===");
@@ -630,8 +671,11 @@ int DeviceRunner::run(
     }
 
     // Publish log config to AICPU via KernelArgs (severity floor + INFO verbosity).
-    kernel_args_.args.log_level = static_cast<uint32_t>(log_level_);
-    kernel_args_.args.log_info_v = static_cast<uint32_t>(log_info_v_);
+    // HostLogger is the single source of truth for log config (seeded by
+    // libsimpler_log.so via simpler_log_init before host_runtime.so was even
+    // dlopen'd). Read it directly when populating KernelArgs.
+    kernel_args_.args.log_level = static_cast<uint32_t>(HostLogger::get_instance().level());
+    kernel_args_.args.log_info_v = static_cast<uint32_t>(HostLogger::get_instance().info_v());
 
     rc = kernel_args_.init_ffts_base_addr();
     if (rc != 0) {
@@ -644,6 +688,25 @@ int DeviceRunner::run(
     if (rc != 0) {
         LOG_ERROR("init_device_kernel_args failed: %d", rc);
         return rc;
+    }
+
+    // Start collector mgmt + poll threads now, just before kernels launch.
+    // Starting earlier wastes CPU on empty queues and risks tripping
+    // ProfilerBase's poll-loop idle-timeout if device-side init is slow.
+    auto thread_factory = [this](std::function<void()> fn) {
+        return create_thread(std::move(fn));
+    };
+    if (enable_l2_swimlane_) {
+        l2_perf_collector_.start(thread_factory);
+    }
+    if (enable_dump_tensor_) {
+        dump_collector_.start(thread_factory);
+    }
+    if (enable_pmu_) {
+        pmu_collector_.start(thread_factory);
+    }
+    if (enable_dep_gen_) {
+        dep_gen_collector_.start(thread_factory);
     }
 
     LOG_INFO_V0("=== launch_aicpu_kernel DynTileFwkKernelServerInit ===");
@@ -672,94 +735,66 @@ int DeviceRunner::run(
         return rc;
     }
 
-    {
-        std::thread collector_thread;
-        if (enable_l2_swimlane_) {
-            collector_thread = create_thread([this, &runtime]() {
-                l2_perf_collector_.poll_and_collect(runtime.get_task_count());
-            });
-        }
-        auto thread_guard = RAIIScopeGuard([&]() {
-            if (collector_thread.joinable()) {
-                collector_thread.join();
-            }
-        });
-        auto collector_signal_guard = RAIIScopeGuard([this, &runtime]() {
-            if (enable_l2_swimlane_) {
-                l2_perf_collector_.signal_execution_complete();
-            }
-        });
-
-        std::thread dump_collector_thread;
-        if (enable_dump_tensor_) {
-            dump_collector_thread = std::thread([this]() {
-                dump_collector_.poll_and_collect(output_prefix_);
-            });
-        }
-        auto dump_thread_guard = RAIIScopeGuard([&]() {
-            if (dump_collector_thread.joinable()) {
-                dump_collector_thread.join();
-            }
-        });
-        auto dump_signal_guard = RAIIScopeGuard([this]() {
-            if (enable_dump_tensor_) {
-                dump_collector_.signal_execution_complete();
-            }
-        });
-
-        std::thread pmu_collector_thread;
-        if (enable_pmu_) {
-            pmu_collector_thread = std::thread([this]() {
-                pmu_collector_.poll_and_collect();
-            });
-        }
-        auto pmu_thread_guard = RAIIScopeGuard([&]() {
-            if (pmu_collector_thread.joinable()) {
-                pmu_collector_thread.join();
-            }
-        });
-        auto pmu_signal_guard = RAIIScopeGuard([this]() {
-            if (enable_pmu_) {
-                pmu_collector_.signal_execution_complete();
-            }
-        });
-
-        LOG_INFO_V0("=== rtStreamSynchronize stream_aicpu_ ===");
-        // Synchronize streams
-        rc = rtStreamSynchronize(stream_aicpu_);
-        if (rc != 0) {
-            LOG_ERROR("rtStreamSynchronize (AICPU) failed: %d", rc);
-            return rc;
-        }
-
-        LOG_INFO_V0("=== rtStreamSynchronize stream_aicore_ ===");
-        rc = rtStreamSynchronize(stream_aicore_);
-        if (rc != 0) {
-            LOG_ERROR("rtStreamSynchronize (AICore) failed: %d", rc);
-            return rc;
-        }
+    LOG_INFO_V0("=== aclrtSynchronizeStreamWithTimeout stream_aicpu_ ===");
+    rc = aclrtSynchronizeStreamWithTimeout(stream_aicpu_, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+    if (rc == ACL_ERROR_RT_STREAM_SYNC_TIMEOUT) {
+        LOG_ERROR(
+            "Stream sync timeout: stream=AICPU timeout_ms=%d device_id=%d block_dim=%d",
+            PLATFORM_STREAM_SYNC_TIMEOUT_MS, device_id_, block_dim_
+        );
+        return rc;
+    }
+    if (rc != 0) {
+        LOG_ERROR("aclrtSynchronizeStreamWithTimeout (AICPU) failed: %d", rc);
+        return rc;
     }
 
-    // Stop memory management, drain remaining buffers, collect phase data, export
+    LOG_INFO_V0("=== aclrtSynchronizeStreamWithTimeout stream_aicore_ ===");
+    rc = aclrtSynchronizeStreamWithTimeout(stream_aicore_, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+    if (rc == ACL_ERROR_RT_STREAM_SYNC_TIMEOUT) {
+        LOG_ERROR(
+            "Stream sync timeout: stream=AICore timeout_ms=%d device_id=%d block_dim=%d",
+            PLATFORM_STREAM_SYNC_TIMEOUT_MS, device_id_, block_dim_
+        );
+        return rc;
+    }
+    if (rc != 0) {
+        LOG_ERROR("aclrtSynchronizeStreamWithTimeout (AICore) failed: %d", rc);
+        return rc;
+    }
+
+    // Tear down collectors. stop() joins mgmt then collector in the only safe
+    // order (mgmt's final-drain pass into L2 has poll as its consumer).
     // Diagnostic exports use the per-task `output_prefix_` directory the user
     // set on CallConfig (CallConfig::validate() enforces non-empty upstream).
     if (enable_l2_swimlane_) {
-        l2_perf_collector_.stop_memory_manager();
-        l2_perf_collector_.drain_remaining_buffers();
-        l2_perf_collector_.scan_remaining_perf_buffers();
-        l2_perf_collector_.collect_phase_data();
-        l2_perf_collector_.export_swimlane_json(output_prefix_);
+        l2_perf_collector_.stop();
+        l2_perf_collector_.read_phase_header_metadata();
+        l2_perf_collector_.reconcile_counters();
+        l2_perf_collector_.export_swimlane_json();
     }
 
     if (enable_dump_tensor_) {
-        dump_collector_.stop_memory_manager();
-        dump_collector_.drain_remaining_buffers();
-        dump_collector_.scan_remaining_dump_buffers();
+        dump_collector_.stop();
+        dump_collector_.reconcile_counters();
         dump_collector_.export_dump_files();
     }
 
-    if (enable_pmu_ && pmu_collector_.is_initialized()) {
-        pmu_collector_.drain_remaining_buffers();
+    if (enable_pmu_) {
+        pmu_collector_.stop();
+        pmu_collector_.reconcile_counters();
+    }
+
+    if (enable_dep_gen_) {
+        dep_gen_collector_.stop();
+        if (dep_gen_collector_.reconcile_counters()) {
+            const auto &records = dep_gen_collector_.records();
+            const std::string deps = make_deps_json_path(output_prefix_);
+            int rc = dep_gen_replay_emit_deps_json(records.data(), records.size(), deps.c_str());
+            if (rc != 0) {
+                LOG_ERROR("dep_gen replay failed (%d) — deps.json not produced", rc);
+            }
+        }
     }
 
     // Print handshake results (reads from device memory, must be before free)
@@ -788,60 +823,204 @@ void DeviceRunner::print_handshake_results() {
 }
 
 int DeviceRunner::prepare_orch_so(Runtime &runtime) {
-    const void *host_so_data = runtime.pending_orch_so_data_;
-    const size_t host_so_size = runtime.pending_orch_so_size_;
-    runtime.pending_orch_so_data_ = nullptr;
-    runtime.pending_orch_so_size_ = 0;
-
-    if (host_so_data == nullptr || host_so_size == 0) {
-        // Host-orchestration mode (no device SO needed).
-        runtime.set_dev_orch_so(0, 0, false);
+    // Prepared-callable flow only: the SO bytes were already H2D'd at
+    // prepare_callable time. Stamp dev_orch_so on the runtime and mark
+    // `is_new` based on whether the AICPU has seen this cid since
+    // registration.
+    const int32_t cid = runtime.get_active_callable_id();
+    if (cid < 0) {
+        LOG_ERROR("prepare_orch_so: no active callable_id; prepared-callable flow required");
+        return -1;
+    }
+    auto it = prepared_callables_.find(cid);
+    if (it == prepared_callables_.end()) {
+        LOG_ERROR("prepare_orch_so: callable_id=%d not registered", cid);
+        return -1;
+    }
+    const auto &state = it->second;
+    // hbg variant: orch SO never crosses the host/device boundary, so the
+    // AICPU does no per-cid dlopen. Skip the orch_so_table_ bookkeeping
+    // (and the AICPU dlopen counter) and clear the device-orch metadata.
+    if (state.host_dlopen_handle != nullptr) {
+        runtime.set_dev_orch_so(0, 0);
+        runtime.set_active_callable_id(cid, /*is_new=*/false);
         return 0;
     }
+    const bool first_sighting = aicpu_seen_callable_ids_.insert(cid).second;
+    if (first_sighting) {
+        ++aicpu_dlopen_total_;
+    }
+    runtime.set_dev_orch_so(state.dev_orch_so_addr, state.dev_orch_so_size);
+    // The c_api caller passed is_new=false; refresh with the authoritative
+    // first_sighting flag before AICPU consumes register_new_callable_id_.
+    runtime.set_active_callable_id(cid, first_sighting);
+    LOG_INFO_V0(
+        "Orch SO prepared cid=%d hash=0x%lx %zu bytes (is_new=%d)", cid, state.hash, state.dev_orch_so_size,
+        first_sighting ? 1 : 0
+    );
+    return 0;
+}
 
-    const uint64_t new_hash = simpler::common::utils::elf_build_id_64(host_so_data, host_so_size);
-
-    if (new_hash == cached_orch_so_hash_ && dev_orch_so_buffer_ != nullptr) {
-        LOG_INFO_V0("Orch SO cache hit (hash=0x%lx, %zu bytes)", new_hash, host_so_size);
-        runtime.set_dev_orch_so(reinterpret_cast<uint64_t>(dev_orch_so_buffer_), host_so_size, /*is_new=*/false);
-        return 0;
+int DeviceRunner::register_prepared_callable(
+    int32_t callable_id, const void *orch_so_data, size_t orch_so_size, const char *func_name, const char *config_name,
+    std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
+) {
+    // The AICPU executor reserves `orch_so_table_[MAX_REGISTERED_CALLABLE_IDS]`
+    // (declared in src/common/task_interface/callable_protocol.h) and indexes it by
+    // callable_id; rejecting an out-of-range id here keeps the host and
+    // AICPU sides in sync and avoids an OOB access at run time.
+    if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) {
+        LOG_ERROR(
+            "register_prepared_callable: callable_id=%d out of range [0, %d)", callable_id, MAX_REGISTERED_CALLABLE_IDS
+        );
+        return -1;
+    }
+    if (orch_so_data == nullptr || orch_so_size == 0) {
+        LOG_ERROR("register_prepared_callable: empty orch SO for callable_id=%d", callable_id);
+        return -1;
+    }
+    if (prepared_callables_.count(callable_id) != 0) {
+        LOG_ERROR("register_prepared_callable: callable_id=%d already registered", callable_id);
+        return -1;
     }
 
-    if (host_so_size > dev_orch_so_capacity_) {
-        if (dev_orch_so_buffer_ != nullptr) {
-            mem_alloc_.free(dev_orch_so_buffer_);
-            dev_orch_so_buffer_ = nullptr;
-            dev_orch_so_capacity_ = 0;
-        }
-        dev_orch_so_buffer_ = mem_alloc_.alloc(host_so_size);
-        if (dev_orch_so_buffer_ == nullptr) {
-            LOG_ERROR("Failed to allocate %zu bytes for orchestration SO buffer", host_so_size);
-            cached_orch_so_hash_ = 0;
+    const uint64_t hash = simpler::common::utils::elf_build_id_64(orch_so_data, orch_so_size);
+
+    // Hash dedup: share device buffer across callable_ids that carry the same
+    // SO bytes. Refcount drops in unregister_prepared_callable; we only free
+    // when the count hits zero.
+    auto buf_it = orch_so_dedup_.find(hash);
+    uint64_t dev_addr = 0;
+    if (buf_it == orch_so_dedup_.end()) {
+        void *buf = mem_alloc_.alloc(orch_so_size);
+        if (buf == nullptr) {
+            LOG_ERROR("register_prepared_callable: alloc %zu bytes failed", orch_so_size);
             return -1;
         }
-        dev_orch_so_capacity_ = host_so_size;
+        int rc = rtMemcpy(buf, orch_so_size, orch_so_data, orch_so_size, RT_MEMCPY_HOST_TO_DEVICE);
+        if (rc != 0) {
+            LOG_ERROR("register_prepared_callable: rtMemcpy failed: %d", rc);
+            mem_alloc_.free(buf);
+            return rc;
+        }
+        OrchSoBuffer entry;
+        entry.dev_addr = buf;
+        entry.capacity = orch_so_size;
+        entry.refcount = 1;
+        orch_so_dedup_.emplace(hash, entry);
+        dev_addr = reinterpret_cast<uint64_t>(buf);
+        LOG_INFO_V0("register_prepared_callable: hash=0x%lx new buffer %zu bytes", hash, orch_so_size);
+    } else {
+        buf_it->second.refcount++;
+        dev_addr = reinterpret_cast<uint64_t>(buf_it->second.dev_addr);
+        LOG_INFO_V0(
+            "register_prepared_callable: hash=0x%lx shared buffer (refcount=%d)", hash, buf_it->second.refcount
+        );
     }
 
-    // Persist a host-side copy so the rtMemcpy source is independent from
-    // any Python ctypes buffer the caller may release as soon as run()
-    // returns. This is also what runtime_maker hands us by reference.
-    host_orch_so_copy_.assign(
-        static_cast<const uint8_t *>(host_so_data), static_cast<const uint8_t *>(host_so_data) + host_so_size
-    );
-
-    int rc = rtMemcpy(
-        dev_orch_so_buffer_, dev_orch_so_capacity_, host_orch_so_copy_.data(), host_so_size, RT_MEMCPY_HOST_TO_DEVICE
-    );
-    if (rc != 0) {
-        LOG_ERROR("rtMemcpy for orchestration SO failed: %d", rc);
-        cached_orch_so_hash_ = 0;
-        return rc;
-    }
-
-    cached_orch_so_hash_ = new_hash;
-    runtime.set_dev_orch_so(reinterpret_cast<uint64_t>(dev_orch_so_buffer_), host_so_size, /*is_new=*/true);
-    LOG_INFO_V0("Orch SO cache miss (hash=0x%lx, %zu bytes uploaded)", new_hash, host_so_size);
+    PreparedCallableState state;
+    state.hash = hash;
+    state.dev_orch_so_addr = dev_addr;
+    state.dev_orch_so_size = orch_so_size;
+    state.func_name = (func_name != nullptr) ? func_name : "";
+    state.config_name = (config_name != nullptr) ? config_name : "";
+    state.kernel_addrs = std::move(kernel_addrs);
+    state.signature = std::move(signature);
+    prepared_callables_.emplace(callable_id, std::move(state));
     return 0;
+}
+
+int DeviceRunner::register_prepared_callable_host_orch(
+    int32_t callable_id, void *host_dlopen_handle, void *host_orch_func_ptr,
+    std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
+) {
+    if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) {
+        LOG_ERROR(
+            "register_prepared_callable_host_orch: callable_id=%d out of range [0, %d)", callable_id,
+            MAX_REGISTERED_CALLABLE_IDS
+        );
+        return -1;
+    }
+    if (host_dlopen_handle == nullptr || host_orch_func_ptr == nullptr) {
+        LOG_ERROR("register_prepared_callable_host_orch: null handle/fn for callable_id=%d", callable_id);
+        return -1;
+    }
+    if (prepared_callables_.count(callable_id) != 0) {
+        LOG_ERROR("register_prepared_callable_host_orch: callable_id=%d already registered", callable_id);
+        return -1;
+    }
+
+    PreparedCallableState state;
+    state.host_dlopen_handle = host_dlopen_handle;
+    state.host_orch_func_ptr = host_orch_func_ptr;
+    state.kernel_addrs = std::move(kernel_addrs);
+    state.signature = std::move(signature);
+    prepared_callables_.emplace(callable_id, std::move(state));
+    ++host_dlopen_total_;
+    LOG_INFO_V0("register_prepared_callable_host_orch: cid=%d (host dlopen #%zu)", callable_id, host_dlopen_total_);
+    return 0;
+}
+
+int DeviceRunner::unregister_prepared_callable(int32_t callable_id) {
+    auto it = prepared_callables_.find(callable_id);
+    if (it == prepared_callables_.end()) {
+        return 0;
+    }
+    PreparedCallableState state = std::move(it->second);
+    prepared_callables_.erase(it);
+    aicpu_seen_callable_ids_.erase(callable_id);
+
+    if (state.host_dlopen_handle != nullptr) {
+        // hbg path: no orch SO refcount, just dlclose the host handle.
+        dlclose(state.host_dlopen_handle);
+        return 0;
+    }
+
+    auto buf_it = orch_so_dedup_.find(state.hash);
+    if (buf_it != orch_so_dedup_.end()) {
+        if (--buf_it->second.refcount <= 0) {
+            mem_alloc_.free(buf_it->second.dev_addr);
+            orch_so_dedup_.erase(buf_it);
+        }
+    }
+    return 0;
+}
+
+bool DeviceRunner::has_prepared_callable(int32_t callable_id) const {
+    return prepared_callables_.count(callable_id) != 0;
+}
+
+BindPreparedCallableResult DeviceRunner::bind_prepared_callable_to_runtime(Runtime &runtime, int32_t callable_id) {
+    auto it = prepared_callables_.find(callable_id);
+    if (it == prepared_callables_.end()) {
+        LOG_ERROR("bind_prepared_callable_to_runtime: callable_id=%d not registered", callable_id);
+        return {-1, nullptr, nullptr, 0};
+    }
+    const auto &state = it->second;
+
+    // Replay kernel addresses directly into runtime->func_id_to_addr_ without
+    // going through set_function_bin_addr. The latter records func_ids in
+    // registered_kernel_func_ids_, which validate_runtime_impl iterates to
+    // free kernel binaries — but prepared kernels must survive across runs.
+    for (const auto &kv : state.kernel_addrs) {
+        if (kv.first < 0 || kv.first >= RUNTIME_MAX_FUNC_ID) {
+            LOG_ERROR("bind_prepared_callable_to_runtime: func_id=%d out of range", kv.first);
+            return {-1, nullptr, nullptr, 0};
+        }
+        runtime.replay_function_bin_addr(kv.first, kv.second);
+    }
+    runtime.set_device_orch_func_name(state.func_name.c_str());
+    runtime.set_device_orch_config_name(state.config_name.c_str());
+    // Stamp callable_id with is_new=false; prepare_orch_so refreshes the flag
+    // with the authoritative first_sighting answer right before launch.
+    runtime.set_active_callable_id(callable_id, /*is_new=*/false);
+    // hbg path: host_orch_func_ptr travels back to the c_api caller, which
+    // hands it to bind_prepared_to_runtime_impl. trb path: stays null and
+    // the device-side orch SO is resolved from the symbol names above.
+    return {
+        0, state.host_orch_func_ptr, state.signature.empty() ? nullptr : state.signature.data(),
+        static_cast<int>(state.signature.size())
+    };
 }
 
 int DeviceRunner::finalize() {
@@ -863,81 +1042,45 @@ int DeviceRunner::finalize() {
     // Cleanup AICPU SO
     so_info_.finalize();
 
-    // Kernel binaries should have been removed by validate_runtime_impl()
-    if (!func_id_to_addr_.empty()) {
-        LOG_ERROR("finalize() called with %zu kernel binaries still cached (memory leak)", func_id_to_addr_.size());
-        // Cleanup leaked binaries to prevent memory leaks
-        for (const auto &pair : func_id_to_addr_) {
-            void *gm_addr = reinterpret_cast<void *>(pair.second);
-            mem_alloc_.free(gm_addr);
-            LOG_DEBUG("Freed leaked kernel binary: func_id=%d, addr=0x%lx", pair.first, pair.second);
-        }
-    }
-    func_id_to_addr_.clear();
     binaries_loaded_ = false;
 
-    // Release the cached orchestration SO buffer.
-    if (dev_orch_so_buffer_ != nullptr) {
-        mem_alloc_.free(dev_orch_so_buffer_);
-        dev_orch_so_buffer_ = nullptr;
+    // Release any chip callable buffers uploaded via upload_chip_callable_buffer.
+    // Pool semantics mirror per-fid binaries: never freed until finalize.
+    for (auto &kv : chip_callable_buffers_) {
+        mem_alloc_.free(reinterpret_cast<void *>(kv.second.chip_dev));
+        LOG_DEBUG(
+            "Freed chip callable buffer: chip_dev=0x%lx, size=%zu, hash=0x%lx", kv.second.chip_dev,
+            kv.second.total_size, kv.first
+        );
     }
-    dev_orch_so_capacity_ = 0;
-    cached_orch_so_hash_ = 0;
-    host_orch_so_copy_.clear();
-    host_orch_so_copy_.shrink_to_fit();
+    chip_callable_buffers_.clear();
 
-    // Cleanup performance profiling
-    if (l2_perf_collector_.is_initialized()) {
-        auto unregister_cb = [](void *dev_ptr, int device_id) -> int {
-            HalHostUnregisterFn fn = get_halHostUnregister();
-            if (fn != nullptr) {
-                return fn(dev_ptr, device_id);
-            }
-            return 0;
-        };
-
-        auto free_cb = [](void *dev_ptr) -> int {
-            return rtFree(dev_ptr);
-        };
-
-        l2_perf_collector_.finalize(unregister_cb, free_cb);
+    // Release any prepared-callable orch SO buffers that callers forgot to
+    // unregister. Refcounts no longer matter at this point — the device is
+    // about to be reset.
+    for (auto &kv : orch_so_dedup_) {
+        if (kv.second.dev_addr != nullptr) {
+            mem_alloc_.free(kv.second.dev_addr);
+        }
     }
-
-    if (dump_collector_.is_initialized()) {
-        auto unregister_cb = [](void *dev_ptr, int device_id, void *user_data) -> int {
-            (void)user_data;
-            HalHostUnregisterFn fn = get_halHostUnregister();
-            if (fn != nullptr) {
-                return fn(dev_ptr, device_id);
-            }
-            return 0;
-        };
-
-        auto free_cb = [](void *dev_ptr, void *user_data) -> int {
-            auto *allocator = static_cast<MemoryAllocator *>(user_data);
-            return allocator->free(dev_ptr);
-        };
-
-        dump_collector_.finalize(unregister_cb, free_cb, &mem_alloc_);
+    orch_so_dedup_.clear();
+    // hbg path: dlclose any host orch handles callers forgot to unregister.
+    // finalize() is the last chance; Worker.close() does not auto-unregister
+    // each callable_id, so without this loop the host process leaks one
+    // dlopen handle per (re)created Worker — observable in long-running
+    // pytest sessions.
+    for (auto &kv : prepared_callables_) {
+        if (kv.second.host_dlopen_handle != nullptr) {
+            dlclose(kv.second.host_dlopen_handle);
+        }
     }
+    prepared_callables_.clear();
+    aicpu_seen_callable_ids_.clear();
+    aicpu_dlopen_total_ = 0;
 
-    if (pmu_collector_.is_initialized()) {
-        auto unregister_cb = [](void *dev_ptr, int device_id, void *user_data) -> int {
-            (void)user_data;
-            HalHostUnregisterFn fn = get_halHostUnregister();
-            if (fn != nullptr) {
-                return fn(dev_ptr, device_id);
-            }
-            return 0;
-        };
-
-        auto free_cb = [](void *dev_ptr, void *user_data) -> int {
-            auto *allocator = static_cast<MemoryAllocator *>(user_data);
-            return allocator->free(dev_ptr);
-        };
-
-        pmu_collector_.finalize(unregister_cb, free_cb, &mem_alloc_);
-    }
+    // Cleanup performance profiling. Normally already done by run()'s
+    // perf_cleanup guard; this is the backstop for the no-run-since-init case.
+    finalize_collectors();
 
     // Free all remaining allocations (including handshake buffer and binGmAddr)
     mem_alloc_.finalize();
@@ -1036,85 +1179,67 @@ int DeviceRunner::launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args) {
 }
 
 // =============================================================================
-// Kernel Binary Upload (returns device address for caller to store in Runtime)
+// Chip Callable Buffer Upload (returns device address of ChipCallable header)
 // =============================================================================
 
-uint64_t DeviceRunner::upload_kernel_binary(int func_id, const uint8_t *bin_data, size_t bin_size) {
-    if (bin_data == nullptr || bin_size == 0) {
-        LOG_ERROR("Invalid kernel binary data");
+uint64_t DeviceRunner::upload_chip_callable_buffer(const ChipCallable *callable) {
+    if (callable == nullptr || callable->child_count() == 0) {
         return 0;
     }
-
-    // Device must be set first (set_device() must be called before upload_kernel_binary())
     if (stream_aicpu_ == nullptr) {
-        LOG_ERROR("Run context not prepared before upload_kernel_binary()");
+        LOG_ERROR("Run context not prepared before upload_chip_callable_buffer()");
         return 0;
     }
 
-    // Return cached callable address if already uploaded
-    auto it = func_id_to_addr_.find(func_id);
-    if (it != func_id_to_addr_.end()) {
-        LOG_INFO_V0("Kernel func_id=%d already uploaded, returning cached address", func_id);
-        return it->second;
+    const ChipCallableLayout layout = compute_chip_callable_layout(callable);
+
+    // Content-hash dedup: identical bytes → return cached chip_dev.
+    auto it = chip_callable_buffers_.find(layout.content_hash);
+    if (it != chip_callable_buffers_.end()) {
+        LOG_DEBUG(
+            "Chip callable dedup hit: chip_dev=0x%lx, size=%zu, hash=0x%lx", it->second.chip_dev, it->second.total_size,
+            layout.content_hash
+        );
+        return it->second.chip_dev;
     }
 
-    LOG_DEBUG("Uploading kernel binary: func_id=%d, size=%zu bytes", func_id, bin_size);
-
-    // Allocate device GM memory for kernel binary
-    void *gm_addr = mem_alloc_.alloc(bin_size);
+    void *gm_addr = mem_alloc_.alloc(layout.total_size);
     if (gm_addr == nullptr) {
-        LOG_ERROR("Failed to allocate device GM memory for kernel func_id=%d", func_id);
+        LOG_ERROR("Failed to allocate device GM for ChipCallable buffer (size=%zu)", layout.total_size);
         return 0;
     }
+    const uint64_t chip_dev = reinterpret_cast<uint64_t>(gm_addr);
+    assert((chip_dev & (CALLABLE_ALIGN - 1)) == 0 && "device alloc must be CALLABLE_ALIGN-byte aligned");
 
-    // Set resolved_addr_ in host buffer before copying to device:
-    // AICPU will read this field to get the binary code address for dispatch
-    uint64_t callable_addr = reinterpret_cast<uint64_t>(gm_addr);
-    assert((callable_addr & (CALLABLE_ALIGN - 1)) == 0 && "device alloc must be CALLABLE_ALIGN-byte aligned");
-    uint64_t binary_code_addr = callable_addr + CoreCallable::binary_data_offset();
-    // Write resolved_addr_ into the host-side buffer (the field lives at a fixed offset)
-    CoreCallable *host_callable = reinterpret_cast<CoreCallable *>(const_cast<uint8_t *>(bin_data));
-    host_callable->set_resolved_addr(binary_code_addr);
+    // Build a host scratch with each child's resolved_addr_ fixed up to the
+    // device-side address of that child's binary code (so the AICPU dispatch
+    // path's `reinterpret_cast<CoreCallable*>(addr)->resolved_addr()` lands
+    // on the right device offset).
+    std::vector<uint8_t> scratch(layout.total_size);
+    std::memcpy(scratch.data(), callable, layout.total_size);
+    patch_chip_callable_scratch_for_device(callable, layout, chip_dev, scratch.data());
 
-    // Copy the full CoreCallable (header + binary) to device
-    int rc = rtMemcpy(gm_addr, bin_size, bin_data, bin_size, RT_MEMCPY_HOST_TO_DEVICE);
+    int rc = rtMemcpy(gm_addr, layout.total_size, scratch.data(), layout.total_size, RT_MEMCPY_HOST_TO_DEVICE);
     if (rc != 0) {
-        LOG_ERROR("rtMemcpy to device failed: %d", rc);
+        LOG_ERROR("rtMemcpy chip callable H2D failed: %d", rc);
         mem_alloc_.free(gm_addr);
         return 0;
     }
 
-    func_id_to_addr_[func_id] = callable_addr;
-
-    LOG_DEBUG("  func_id=%d -> callable_addr=0x%lx, binary_code_addr=0x%lx", func_id, callable_addr, binary_code_addr);
-
-    return callable_addr;
+    chip_callable_buffers_.emplace(layout.content_hash, ChipCallableBuffer{chip_dev, layout.total_size});
+    LOG_DEBUG(
+        "Uploaded chip callable: chip_dev=0x%lx, size=%zu, child_count=%d, hash=0x%lx", chip_dev, layout.total_size,
+        callable->child_count(), layout.content_hash
+    );
+    return chip_dev;
 }
 
-void DeviceRunner::remove_kernel_binary(int func_id) {
-    auto it = func_id_to_addr_.find(func_id);
-    if (it == func_id_to_addr_.end()) {
-        return;
-    }
-
-    uint64_t function_bin_addr = it->second;
-    void *gm_addr = reinterpret_cast<void *>(function_bin_addr);
-
-    mem_alloc_.free(gm_addr);
-    func_id_to_addr_.erase(it);
-
-    LOG_DEBUG("Removed kernel binary: func_id=%d, addr=0x%lx", func_id, function_bin_addr);
-}
-
-int DeviceRunner::init_l2_perf_collection(int num_aicore, int device_id) {
-    // Define allocation callback (a2a3: use rtMalloc directly)
-    auto alloc_cb = [](size_t size) -> void * {
-        void *ptr = nullptr;
-        int rc = rtMalloc(&ptr, size, RT_MEMORY_HBM, 0);
-        return (rc == 0) ? ptr : nullptr;
+int DeviceRunner::init_l2_perf(int num_aicore, int device_id) {
+    auto alloc_cb = [](size_t size, void *user_data) -> void * {
+        auto *allocator = static_cast<MemoryAllocator *>(user_data);
+        return allocator->alloc(size);
     };
 
-    // Define registration callback (a2a3: use halHostRegister for shared memory)
     auto register_cb = [](void *dev_ptr, size_t size, int device_id, void **host_ptr) -> int {
         if (load_hal_if_needed() != 0) {
             LOG_ERROR("Failed to load ascend_hal for profiling: %s", dlerror());
@@ -1128,19 +1253,25 @@ int DeviceRunner::init_l2_perf_collection(int num_aicore, int device_id) {
         return fn(dev_ptr, size, DEV_SVM_MAP_HOST, device_id, host_ptr);
     };
 
-    auto free_cb = [](void *dev_ptr) -> int {
-        return rtFree(dev_ptr);
+    auto free_cb = [](void *dev_ptr, void *user_data) -> int {
+        auto *allocator = static_cast<MemoryAllocator *>(user_data);
+        return allocator->free(dev_ptr);
     };
 
-    int rc = l2_perf_collector_.initialize(num_aicore, device_id, alloc_cb, register_cb, free_cb);
-    if (rc == 0) {
-        kernel_args_.args.l2_perf_data_base =
-            reinterpret_cast<uint64_t>(l2_perf_collector_.get_l2_perf_setup_device_ptr());
+    int rc = l2_perf_collector_.initialize(
+        num_aicore, device_id, alloc_cb, register_cb, free_cb, &mem_alloc_, output_prefix_
+    );
+    if (rc != 0) {
+        return rc;
     }
-    return rc;
+
+    kernel_args_.args.l2_perf_data_base = reinterpret_cast<uint64_t>(l2_perf_collector_.get_l2_perf_setup_device_ptr());
+    kernel_args_.args.aicore_ring_addr =
+        reinterpret_cast<uint64_t>(l2_perf_collector_.get_aicore_ring_addr_table_device_ptr());
+    return 0;
 }
 
-int DeviceRunner::init_tensor_dump(Runtime &runtime, int num_aicore, int device_id) {
+int DeviceRunner::init_tensor_dump(Runtime &runtime, int device_id) {
     int num_dump_threads = runtime.sche_cpu_num;
 
     auto alloc_cb = [](size_t size, void *user_data) -> void * {
@@ -1148,8 +1279,7 @@ int DeviceRunner::init_tensor_dump(Runtime &runtime, int num_aicore, int device_
         return allocator->alloc(size);
     };
 
-    auto register_cb = [](void *dev_ptr, size_t size, int device_id, void *user_data, void **host_ptr) -> int {
-        (void)user_data;
+    auto register_cb = [](void *dev_ptr, size_t size, int device_id, void **host_ptr) -> int {
         if (load_hal_if_needed() != 0) {
             LOG_ERROR("Failed to load ascend_hal for tensor dump: %s", dlerror());
             return -1;
@@ -1167,12 +1297,8 @@ int DeviceRunner::init_tensor_dump(Runtime &runtime, int num_aicore, int device_
         return allocator->free(dev_ptr);
     };
 
-    auto set_device_cb = [](int device_id, void * /*user_data*/) -> int {
-        return rtSetDevice(device_id);
-    };
-
     int rc = dump_collector_.initialize(
-        num_dump_threads, device_id, alloc_cb, register_cb, free_cb, &mem_alloc_, set_device_cb
+        num_dump_threads, device_id, alloc_cb, register_cb, free_cb, &mem_alloc_, output_prefix_
     );
     if (rc != 0) {
         return rc;
@@ -1182,7 +1308,7 @@ int DeviceRunner::init_tensor_dump(Runtime &runtime, int num_aicore, int device_
     return 0;
 }
 
-int DeviceRunner::init_pmu_buffers(
+int DeviceRunner::init_pmu(
     int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id
 ) {
     auto alloc_cb = [](size_t size, void *user_data) -> void * {
@@ -1190,8 +1316,7 @@ int DeviceRunner::init_pmu_buffers(
         return allocator->alloc(size);
     };
 
-    auto register_cb = [](void *dev_ptr, size_t size, int device_id, void *user_data, void **host_ptr) -> int {
-        (void)user_data;
+    auto register_cb = [](void *dev_ptr, size_t size, int device_id, void **host_ptr) -> int {
         if (load_hal_if_needed() != 0) {
             LOG_ERROR("Failed to load ascend_hal for PMU: %s", dlerror());
             return -1;
@@ -1210,8 +1335,72 @@ int DeviceRunner::init_pmu_buffers(
     };
 
     int rc = pmu_collector_.init(
-        num_cores, num_threads, &kernel_args_.args.pmu_data_base, csv_path, event_type, alloc_cb, register_cb, free_cb,
-        &mem_alloc_, device_id
+        num_cores, num_threads, csv_path, event_type, alloc_cb, register_cb, free_cb, &mem_alloc_, device_id
     );
-    return rc;
+    if (rc != 0) {
+        return rc;
+    }
+
+    kernel_args_.args.pmu_data_base = reinterpret_cast<uint64_t>(pmu_collector_.get_pmu_shm_device_ptr());
+    return 0;
+}
+
+int DeviceRunner::init_dep_gen(int num_threads, int device_id) {
+    auto alloc_cb = [](size_t size, void *user_data) -> void * {
+        auto *allocator = static_cast<MemoryAllocator *>(user_data);
+        return allocator->alloc(size);
+    };
+
+    auto register_cb = [](void *dev_ptr, size_t size, int device_id, void **host_ptr) -> int {
+        if (load_hal_if_needed() != 0) {
+            LOG_ERROR("Failed to load ascend_hal for dep_gen: %s", dlerror());
+            return -1;
+        }
+        HalHostRegisterFn fn = get_halHostRegister();
+        if (fn == nullptr) {
+            LOG_ERROR("halHostRegister symbol not found: %s", dlerror());
+            return -1;
+        }
+        return fn(dev_ptr, size, DEV_SVM_MAP_HOST, device_id, host_ptr);
+    };
+
+    auto free_cb = [](void *dev_ptr, void *user_data) -> int {
+        auto *allocator = static_cast<MemoryAllocator *>(user_data);
+        return allocator->free(dev_ptr);
+    };
+
+    int rc = dep_gen_collector_.init(num_threads, alloc_cb, register_cb, free_cb, &mem_alloc_, device_id);
+    if (rc != 0) {
+        return rc;
+    }
+
+    kernel_args_.args.dep_gen_data_base = reinterpret_cast<uint64_t>(dep_gen_collector_.get_dep_gen_shm_device_ptr());
+    return 0;
+}
+
+void DeviceRunner::finalize_collectors() {
+    auto unregister_cb = [](void *dev_ptr, int device_id) -> int {
+        HalHostUnregisterFn fn = get_halHostUnregister();
+        if (fn != nullptr) {
+            return fn(dev_ptr, device_id);
+        }
+        return 0;
+    };
+    auto free_cb = [](void *dev_ptr, void *user_data) -> int {
+        auto *allocator = static_cast<MemoryAllocator *>(user_data);
+        return allocator->free(dev_ptr);
+    };
+
+    if (l2_perf_collector_.is_initialized()) {
+        l2_perf_collector_.finalize(unregister_cb, free_cb, &mem_alloc_);
+    }
+    if (dump_collector_.is_initialized()) {
+        dump_collector_.finalize(unregister_cb, free_cb, &mem_alloc_);
+    }
+    if (pmu_collector_.is_initialized()) {
+        pmu_collector_.finalize(unregister_cb, free_cb, &mem_alloc_);
+    }
+    if (dep_gen_collector_.is_initialized()) {
+        dep_gen_collector_.finalize(unregister_cb, free_cb, &mem_alloc_);
+    }
 }

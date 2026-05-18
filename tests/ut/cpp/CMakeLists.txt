@@ -53,7 +53,7 @@ find_library(GTEST_MAIN_LIB gtest_main PATHS ${GTEST_SEARCH_PATHS})
 if(NOT GTEST_LIB OR NOT GTEST_MAIN_LIB)
     message(STATUS "System GoogleTest not found — fetching via FetchContent")
     # Match the ABI the tests themselves compile with
-    # (-D_GLIBCXX_USE_CXX11_ABI=0 — see add_hierarchical_test / add_comm_api_test).
+    # (-D_GLIBCXX_USE_CXX11_ABI=0 — see add_hierarchical_test).
     # Without this the FetchContent-built libgtest.a ends up with the default
     # cxx11 ABI and link fails against our tests.
     add_compile_options(-D_GLIBCXX_USE_CXX11_ABI=0)
@@ -75,40 +75,38 @@ if(NOT GTEST_LIB OR NOT GTEST_MAIN_LIB)
 endif()
 
 # ---------------------------------------------------------------------------
-# A2A3 runtime sources and stubs for ring-buffer / tensormap tests
+# A2A3 runtime sources and stubs for ring-buffer / tensormap tests.
+#
+# Bundled into an OBJECT library so the runtime .cpp files compile once and
+# the resulting .o files are reused across every test executable. PUBLIC
+# include dirs / compile options propagate to consumers via
+# target_link_libraries, so test executables get the same flags they would
+# have had if the sources were listed directly.
 # ---------------------------------------------------------------------------
 set(A2A3_RUNTIME_DIR ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/runtime)
-set(A2A3_STUB_SOURCES ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp)
-set(A2A3_RUNTIME_SOURCES
+
+add_library(a2a3_rt_objs OBJECT
     ${A2A3_RUNTIME_DIR}/pto_ring_buffer.cpp
     ${A2A3_RUNTIME_DIR}/shared/pto_shared_memory.cpp
     ${A2A3_RUNTIME_DIR}/scheduler/pto_scheduler.cpp
-    ${A2A3_RUNTIME_DIR}/pto_tensormap.cpp
+    ${A2A3_RUNTIME_DIR}/shared/pto_tensormap.cpp
+    ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
 )
-
-set(A2A3_COMMON_INCLUDE_DIRS
+target_include_directories(a2a3_rt_objs PUBLIC
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/orchestration
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/runtime
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/common
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
     ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
 )
+target_compile_options(a2a3_rt_objs PUBLIC -D_GLIBCXX_USE_CXX11_ABI=0)
 
-function(add_a2a3_runtime_test name)
-    cmake_parse_arguments(ARG "" "" "SOURCES;EXTRA_SOURCES" ${ARGN})
-    set(_all_sources ${ARG_SOURCES} ${A2A3_STUB_SOURCES})
-    foreach(src ${ARG_SOURCES} ${ARG_EXTRA_SOURCES})
-        if(EXISTS ${src})
-            list(APPEND _all_sources ${src})
-        endif()
-    endforeach()
-    add_executable(${name} ${_all_sources})
-    target_include_directories(${name} PRIVATE
-        ${GTEST_INCLUDE_DIRS}
-        ${A2A3_COMMON_INCLUDE_DIRS}
-    )
-    target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
+function(add_a2a3_runtime_test name src)
+    add_executable(${name} ${src})
+    target_include_directories(${name} PRIVATE ${GTEST_INCLUDE_DIRS})
     target_link_libraries(${name} PRIVATE
+        a2a3_rt_objs
         ${GTEST_MAIN_LIB}
         ${GTEST_LIB}
         pthread
@@ -118,13 +116,13 @@ function(add_a2a3_runtime_test name)
 endfunction()
 
 # ---------------------------------------------------------------------------
-# Distributed runtime sources under test
+# Distributed runtime sources under test, bundled into an OBJECT library so
+# they compile once and link into every hierarchical test.
 # ---------------------------------------------------------------------------
 set(HIERARCHICAL_SRC_DIR ${CMAKE_SOURCE_DIR}/../../../src/common/hierarchical)
-
 set(WORKER_SRC_DIR ${CMAKE_SOURCE_DIR}/../../../src/common/worker)
 
-set(HIERARCHICAL_SOURCES
+add_library(hierarchical_objs OBJECT
     ${HIERARCHICAL_SRC_DIR}/types.cpp
     ${HIERARCHICAL_SRC_DIR}/tensormap.cpp
     ${HIERARCHICAL_SRC_DIR}/ring.cpp
@@ -135,20 +133,18 @@ set(HIERARCHICAL_SOURCES
     ${HIERARCHICAL_SRC_DIR}/worker.cpp
     ${WORKER_SRC_DIR}/chip_worker.cpp
 )
+target_include_directories(hierarchical_objs PUBLIC
+    ${HIERARCHICAL_SRC_DIR}
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+    ${WORKER_SRC_DIR}
+)
+target_compile_options(hierarchical_objs PUBLIC -D_GLIBCXX_USE_CXX11_ABI=0)
 
-# ---------------------------------------------------------------------------
-# Helper: add one test executable
-# ---------------------------------------------------------------------------
 function(add_hierarchical_test name src)
-    add_executable(${name} ${src} ${HIERARCHICAL_SOURCES})
-    target_include_directories(${name} PRIVATE
-        ${GTEST_INCLUDE_DIRS}
-        ${HIERARCHICAL_SRC_DIR}
-        ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
-        ${WORKER_SRC_DIR}
-    )
-    target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
+    add_executable(${name} ${src})
+    target_include_directories(${name} PRIVATE ${GTEST_INCLUDE_DIRS})
     target_link_libraries(${name} PRIVATE
+        hierarchical_objs
         ${GTEST_MAIN_LIB}
         ${GTEST_LIB}
         pthread
@@ -165,6 +161,7 @@ function(add_a2a3_test name src)
         ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/common
         ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
         ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+        ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
     )
     target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
     target_link_libraries(${name} PRIVATE
@@ -184,6 +181,7 @@ function(add_a5_test name src)
         ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/tensormap_and_ringbuffer/common
         ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/include
         ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+        ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
     )
     target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
     target_link_libraries(${name} PRIVATE
@@ -241,6 +239,27 @@ add_hierarchical_test(test_scheduler  hierarchical/test_scheduler.cpp)
 # Types / task_interface tests (src/common/task_interface/)
 # ---------------------------------------------------------------------------
 add_task_interface_test(test_child_memory types/test_child_memory.cpp)
+add_task_interface_test(test_chip_max_tensor_args types/test_chip_max_tensor_args.cpp)
+
+# Contract test for upload_chip_callable_buffer caller-buffer immutability.
+# Pulls both task_interface (callable.h) and src/common (utils/fnv1a_64.h),
+# so it can't use add_task_interface_test as-is.
+add_executable(test_chip_callable_upload_immutable
+    types/test_chip_callable_upload_immutable.cpp
+)
+target_include_directories(test_chip_callable_upload_immutable PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+)
+target_compile_options(test_chip_callable_upload_immutable PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
+target_link_libraries(test_chip_callable_upload_immutable PRIVATE
+    ${GTEST_MAIN_LIB}
+    ${GTEST_LIB}
+    pthread
+)
+add_test(NAME test_chip_callable_upload_immutable COMMAND test_chip_callable_upload_immutable)
+set_tests_properties(test_chip_callable_upload_immutable PROPERTIES LABELS "no_hardware")
 
 # ---------------------------------------------------------------------------
 # Common utilities tests (src/common/utils/)
@@ -248,52 +267,42 @@ add_task_interface_test(test_child_memory types/test_child_memory.cpp)
 add_common_utils_test(test_elf_build_id common/test_elf_build_id.cpp)
 add_common_utils_test(test_runtime_orch_so common/test_runtime_orch_so.cpp)
 
+# Per-callable_id orch SO file naming regression (see rtStreamSynchronize
+# 507018 root cause). Compiles the a2a3 onboard `create_orch_so_file`
+# against the test source so it runs on no-hw runners too.
+add_executable(test_orch_so_file
+    common/test_orch_so_file.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/onboard/aicpu/orch_so_file.cpp
+)
+target_include_directories(test_orch_so_file PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+)
+target_compile_options(test_orch_so_file PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
+target_link_libraries(test_orch_so_file PRIVATE
+    ${GTEST_MAIN_LIB}
+    ${GTEST_LIB}
+    pthread
+)
+add_test(NAME test_orch_so_file COMMAND test_orch_so_file)
+set_tests_properties(test_orch_so_file PROPERTIES LABELS "no_hardware")
+
 # ---------------------------------------------------------------------------
 # A2A3 tests (src/a2a3/runtime/tensormap_and_ringbuffer/)
 # ---------------------------------------------------------------------------
 add_a2a3_test(test_a2a3_fatal a2a3/test_a2a3_fatal.cpp)
 
 # PTO2 runtime-linked tests
-add_a2a3_runtime_test(test_task_allocator
-    SOURCES a2a3/test_task_allocator.cpp
-    EXTRA_SOURCES ${A2A3_RUNTIME_SOURCES}
-)
-add_a2a3_runtime_test(test_dep_list_pool
-    SOURCES a2a3/test_dep_list_pool.cpp
-    EXTRA_SOURCES ${A2A3_RUNTIME_SOURCES}
-)
-add_a2a3_runtime_test(test_scheduler_state
-    SOURCES a2a3/test_scheduler_state.cpp
-    EXTRA_SOURCES ${A2A3_RUNTIME_SOURCES}
-)
-add_a2a3_runtime_test(test_task_state
-    SOURCES a2a3/test_task_state.cpp
-    EXTRA_SOURCES ${A2A3_RUNTIME_SOURCES}
-)
-add_a2a3_runtime_test(test_ready_queue
-    SOURCES a2a3/test_ready_queue.cpp
-    EXTRA_SOURCES ${A2A3_RUNTIME_SOURCES}
-)
-add_a2a3_runtime_test(test_shared_memory
-    SOURCES a2a3/test_shared_memory.cpp
-    EXTRA_SOURCES ${A2A3_RUNTIME_SOURCES}
-)
-add_a2a3_runtime_test(test_a2a3_tensormap
-    SOURCES a2a3/test_tensormap.cpp
-    EXTRA_SOURCES ${A2A3_RUNTIME_SOURCES}
-)
-add_a2a3_runtime_test(test_fanin_pool
-    SOURCES a2a3/test_fanin_pool.cpp
-    EXTRA_SOURCES ${A2A3_RUNTIME_SOURCES}
-)
-add_a2a3_runtime_test(test_spsc_queue
-    SOURCES a2a3/test_spsc_queue.cpp
-    EXTRA_SOURCES ${A2A3_RUNTIME_SOURCES}
-)
-add_a2a3_runtime_test(test_wiring
-    SOURCES a2a3/test_wiring.cpp
-    EXTRA_SOURCES ${A2A3_RUNTIME_SOURCES}
-)
+add_a2a3_runtime_test(test_task_allocator   a2a3/test_task_allocator.cpp)
+add_a2a3_runtime_test(test_dep_list_pool    a2a3/test_dep_list_pool.cpp)
+add_a2a3_runtime_test(test_scheduler_state  a2a3/test_scheduler_state.cpp)
+add_a2a3_runtime_test(test_task_state       a2a3/test_task_state.cpp)
+add_a2a3_runtime_test(test_ready_queue      a2a3/test_ready_queue.cpp)
+add_a2a3_runtime_test(test_shared_memory    a2a3/test_shared_memory.cpp)
+add_a2a3_runtime_test(test_a2a3_tensormap   a2a3/test_tensormap.cpp)
+add_a2a3_runtime_test(test_fanin_pool       a2a3/test_fanin_pool.cpp)
+add_a2a3_runtime_test(test_spsc_queue       a2a3/test_spsc_queue.cpp)
+add_a2a3_runtime_test(test_wiring           a2a3/test_wiring.cpp)
 
 # ---------------------------------------------------------------------------
 # A5 tests (src/a5/runtime/tensormap_and_ringbuffer/)
@@ -301,15 +310,16 @@ add_a2a3_runtime_test(test_wiring
 add_a5_test(test_a5_fatal a5/test_a5_fatal.cpp)
 
 # Host logger silent/off behavior — no runtime deps, just compile host_log.cpp
-# alongside the test.
-set(A5_HOST_LOG_DIR ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/src/host)
+# alongside the test (faster than dlopen'ing libsimpler_log.so for a unit test).
+set(SIMPLER_LOG_DIR ${CMAKE_SOURCE_DIR}/../../../src/common/log)
 add_executable(test_host_log_off
     a5/test_host_log_off.cpp
-    ${A5_HOST_LOG_DIR}/host_log.cpp
+    ${SIMPLER_LOG_DIR}/host_log.cpp
 )
 target_include_directories(test_host_log_off PRIVATE
     ${GTEST_INCLUDE_DIRS}
-    ${A5_HOST_LOG_DIR}
+    ${SIMPLER_LOG_DIR}
+    ${SIMPLER_LOG_DIR}/include
 )
 target_compile_options(test_host_log_off PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
 target_link_libraries(test_host_log_off PRIVATE
@@ -325,8 +335,6 @@ add_test(NAME test_host_log_off COMMAND test_host_log_off)
 # invariant that lets future hw tests freely link against CANN libraries
 # without breaking the no-hw build.
 if(SIMPLER_ENABLE_HARDWARE_TESTS)
-    # Hardware-only UT for the HCCL backend of the comm_* C API.
-    #
     # libhost_runtime.so is loaded via dlopen at runtime — it is the
     # subject under test and mirrors how ChipWorker selects a runtime
     # backend in production.  libascendcl.so, by contrast, is generic
@@ -342,6 +350,13 @@ if(SIMPLER_ENABLE_HARDWARE_TESTS)
     set(HOST_RUNTIME_LIB
         "${PROJECT_ROOT}/build/lib/a2a3/onboard/tensormap_and_ringbuffer/libhost_runtime.so"
     )
+    # libsimpler_log.so must be loaded RTLD_GLOBAL before host_runtime dlopen
+    # so undefined HostLogger / unified_log_* symbols in host_runtime resolve.
+    # Mirrors what ChipWorker::init does in production. The library is
+    # process-global (one .so per host toolchain, not per arch/variant).
+    set(SIMPLER_LOG_LIB
+        "${PROJECT_ROOT}/build/lib/libsimpler_log.so"
+    )
 
     if(NOT DEFINED ENV{ASCEND_HOME_PATH})
         message(FATAL_ERROR
@@ -352,33 +367,32 @@ if(SIMPLER_ENABLE_HARDWARE_TESTS)
     find_library(ASCENDCL_LIB ascendcl
         PATHS ${ASCEND_HOME_PATH}/lib64 NO_DEFAULT_PATH REQUIRED)
 
-    function(add_comm_api_test name src)
-        add_executable(${name} ${src})
-        target_include_directories(${name} PRIVATE
-            ${GTEST_INCLUDE_DIRS}
-            ${PROJECT_ROOT}/src/a2a3/platform/include
-            # Shared platform_comm headers (comm.h / comm_context.h) moved
-            # under src/common so both a2a3 HCCL and a5/a2a3 sim can use them.
-            ${PROJECT_ROOT}/src/common
-            ${ASCEND_HOME_PATH}/include
-        )
-        target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
-        target_compile_definitions(${name} PRIVATE
-            PTO_HOST_RUNTIME_LIB_PATH="${HOST_RUNTIME_LIB}"
-        )
-        target_link_libraries(${name} PRIVATE
-            ${GTEST_MAIN_LIB}
-            ${GTEST_LIB}
-            ${ASCENDCL_LIB}
-            pthread
-            dl
-        )
-        add_test(NAME ${name} COMMAND ${name})
-        set_tests_properties(${name} PROPERTIES
-            LABELS "requires_hardware_a2a3"
-            RESOURCE_GROUPS "2,npus:1"
-        )
-    endfunction()
-
-    add_comm_api_test(test_hccl_comm hardware/test_hccl_comm.cpp)
+    # Black-box lifecycle UT for the comm_* C API on Path D. See the file
+    # header for the contract it pins down.
+    add_executable(test_comm_lifecycle hardware/test_comm_lifecycle.cpp)
+    target_include_directories(test_comm_lifecycle PRIVATE
+        ${GTEST_INCLUDE_DIRS}
+        ${PROJECT_ROOT}/src/a2a3/platform/include
+        # Shared platform_comm headers (comm.h / comm_context.h) live under
+        # src/common so both a2a3 HCCL and a5/a2a3 sim can use them.
+        ${PROJECT_ROOT}/src/common
+        ${ASCEND_HOME_PATH}/include
+    )
+    target_compile_options(test_comm_lifecycle PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
+    target_compile_definitions(test_comm_lifecycle PRIVATE
+        PTO_HOST_RUNTIME_LIB_PATH="${HOST_RUNTIME_LIB}"
+        SIMPLER_LOG_LIB_PATH="${SIMPLER_LOG_LIB}"
+    )
+    target_link_libraries(test_comm_lifecycle PRIVATE
+        ${GTEST_MAIN_LIB}
+        ${GTEST_LIB}
+        ${ASCENDCL_LIB}
+        pthread
+        dl
+    )
+    add_test(NAME test_comm_lifecycle COMMAND test_comm_lifecycle)
+    set_tests_properties(test_comm_lifecycle PROPERTIES
+        LABELS "requires_hardware_a2a3"
+        RESOURCE_GROUPS "2,npus:1"
+    )
 endif()

@@ -62,27 +62,6 @@ PTO2SchedProfilingData scheduler_get_profiling(int thread_idx) {
 #endif
 
 // =============================================================================
-// Task State Names
-// =============================================================================
-
-const char *task_state_name(PTO2TaskState state) {
-    switch (state) {
-    case PTO2_TASK_PENDING:
-        return "PENDING";
-    case PTO2_TASK_READY:
-        return "READY";
-    case PTO2_TASK_RUNNING:
-        return "RUNNING";
-    case PTO2_TASK_COMPLETED:
-        return "COMPLETED";
-    case PTO2_TASK_CONSUMED:
-        return "CONSUMED";
-    default:
-        return "UNKNOWN";
-    }
-}
-
-// =============================================================================
 // Ready Queue Implementation
 // =============================================================================
 
@@ -170,6 +149,17 @@ bool PTO2SchedulerState::init(PTO2SharedMemoryHeader *sm_header, int32_t dep_poo
         }
     }
 
+    // Initialize the DUMMY (dep-only task) ready queue.
+    if (!ready_queue_init(&sched->dummy_ready_queue, PTO2_READY_QUEUE_SIZE)) {
+        for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
+            ready_queue_destroy(&sched->ready_queues[i]);
+        }
+        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+            sched->ring_sched_states[r].destroy();
+        }
+        return false;
+    }
+
     // Initialize per-ring wiring queues and dep pools (exclusively managed by scheduler thread 0)
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         PTO2DepListEntry *dep_entries =
@@ -181,6 +171,7 @@ bool PTO2SchedulerState::init(PTO2SharedMemoryHeader *sm_header, int32_t dep_poo
             for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
                 ready_queue_destroy(&sched->ready_queues[i]);
             }
+            ready_queue_destroy(&sched->dummy_ready_queue);
             sched->wiring.queue.destroy();
             for (int rr = 0; rr < PTO2_MAX_RING_DEPTH; rr++) {
                 sched->ring_sched_states[rr].destroy();
@@ -198,6 +189,7 @@ bool PTO2SchedulerState::init(PTO2SharedMemoryHeader *sm_header, int32_t dep_poo
         for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
             ready_queue_destroy(&sched->ready_queues[i]);
         }
+        ready_queue_destroy(&sched->dummy_ready_queue);
         for (int rr = 0; rr < PTO2_MAX_RING_DEPTH; rr++) {
             sched->ring_sched_states[rr].destroy();
         }
@@ -223,6 +215,7 @@ void PTO2SchedulerState::destroy() {
     for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         ready_queue_destroy(&sched->ready_queues[i]);
     }
+    ready_queue_destroy(&sched->dummy_ready_queue);
 }
 
 // =============================================================================
@@ -261,6 +254,7 @@ void PTO2SchedulerState::print_queues() {
     for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         LOG_INFO_V0("  %s: count=%" PRIu64, shape_names[i], sched->ready_queues[i].size());
     }
+    LOG_INFO_V0("  DUMMY: count=%" PRIu64, sched->dummy_ready_queue.size());
 
     LOG_INFO_V0("====================");
 }

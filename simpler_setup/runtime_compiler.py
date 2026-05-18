@@ -111,6 +111,20 @@ class RuntimeCompiler:
     def _init_a2a3(self):
         """Initialize toolchains for real a2a3 hardware."""
         env_manager.ensure("ASCEND_HOME_PATH")
+        # a2a3 onboard host_runtime hard-depends on pto-isa headers + CANN-9.0
+        # aclnn syms (cf. src/a2a3/platform/onboard/host/CMakeLists.txt
+        # SIMPLER_ENABLE_PTO_SDMA_WORKSPACE marker). PTO_ISA_ROOT must be
+        # populated by the caller — no auto-clone fallback here. Resolved by:
+        #   - pip install: top-level CMakeLists invokes
+        #     simpler_setup/build_runtimes.py --clone-protocol <proto> which
+        #     calls ensure_pto_isa_root() and sets os.environ.
+        #   - pytest:      conftest.py::pytest_configure does the same, with
+        #     the --clone-protocol pytest flag.
+        #   - Direct callers (e.g. CI `python -c "RuntimeBuilder('a2a3')..."`
+        #     or `python examples/.../test_*.py` standalone) must export
+        #     PTO_ISA_ROOT in env before constructing this RuntimeCompiler;
+        #     CI workflows propagate it via $GITHUB_ENV after the install step.
+        env_manager.ensure("PTO_ISA_ROOT")
 
         # AICore: Bisheng CCE compiler
         ccec = CCECToolchain(platform="a2a3")
@@ -414,3 +428,44 @@ class RuntimeCompiler:
             ctx_build_dir = Path(os.path.realpath(build_dir)) / "sim_context"
             os.makedirs(ctx_build_dir, exist_ok=True)
             return _build(str(ctx_build_dir))
+
+    def compile_simpler_log(
+        self,
+        build_dir: Optional[str] = None,
+        output_dir: Optional[Union[str, Path]] = None,
+    ) -> Union[bytes, Path]:
+        """Compile the standalone libsimpler_log.so (all platforms).
+
+        Single-instance host-side HostLogger. Loaded with RTLD_GLOBAL by
+        ChipWorker so every consumer .so (host_runtime, cpu_sim_context,
+        the binding) shares one HostLogger across the process.
+        """
+        cmake_source_dir = str(self.project_root / "src" / "common" / "log")
+        binary_name = "libsimpler_log.so"
+        cmake_args = self.host_target.toolchain.get_cmake_args()
+
+        def _build(actual_build_dir: str) -> Union[bytes, Path]:
+            binary_path = self._run_compilation(
+                cmake_source_dir,
+                cmake_args,
+                binary_name,
+                platform="SIMPLER_LOG",
+                build_dir=actual_build_dir,
+            )
+            if output_dir is not None:
+                od = Path(output_dir)
+                od.mkdir(parents=True, exist_ok=True)
+                dest = od / binary_name
+                shutil.copy2(binary_path, dest)
+                return dest
+            else:
+                with open(binary_path, "rb") as f:
+                    return f.read()
+
+        if build_dir is None:
+            with tempfile.TemporaryDirectory(prefix="simpler_log_build_", dir="/tmp") as tmp_dir:
+                return _build(tmp_dir)
+        else:
+            log_build_dir = Path(os.path.realpath(build_dir)) / "simpler_log"
+            os.makedirs(log_build_dir, exist_ok=True)
+            return _build(str(log_build_dir))

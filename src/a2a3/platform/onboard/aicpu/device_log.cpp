@@ -35,8 +35,6 @@ bool g_is_log_enable_error = false;
 
 int g_log_info_v = 5;
 
-const char *TILE_FWK_DEVICE_MACHINE = "AI_CPU";
-
 void init_log_switch() {
     g_is_log_enable_debug = CheckLogLevel(AICPU, DLOG_DEBUG);
     g_is_log_enable_info = CheckLogLevel(AICPU, DLOG_INFO);
@@ -58,42 +56,34 @@ extern "C" void set_log_info_v(int v) {
 extern "C" int get_log_info_v() { return g_log_info_v; }
 
 // =============================================================================
-// Low-level dev_log_* (onboard: route through CANN dlog)
+// Low-level dev_log_* / dev_vlog_* (onboard: route through CANN dlog)
+//
+// CANN's dlog API is variadic only (no va_list variant), so the va_list path
+// still buffers via vsnprintf — same total cost as before, just moved one
+// frame deeper so unified_log_device.cpp can call dev_vlog_* uniformly.
 // =============================================================================
 
-void dev_log_debug(const char *func, const char *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
+void dev_vlog_debug(const char *func, const char *fmt, va_list args) {
     char buffer[2048];
     vsnprintf(buffer, sizeof(buffer), fmt, args);
-    va_end(args);
     dlog_debug(AICPU, "%lu %s\n\"%s\"", GET_TID(), func, buffer);
 }
 
-void dev_log_warn(const char *func, const char *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
+void dev_vlog_warn(const char *func, const char *fmt, va_list args) {
     char buffer[2048];
     vsnprintf(buffer, sizeof(buffer), fmt, args);
-    va_end(args);
     dlog_warn(AICPU, "%lu %s\n\"%s\"", GET_TID(), func, buffer);
 }
 
-void dev_log_error(const char *func, const char *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
+void dev_vlog_error(const char *func, const char *fmt, va_list args) {
     char buffer[2048];
     vsnprintf(buffer, sizeof(buffer), fmt, args);
-    va_end(args);
     dlog_error(AICPU, "%lu %s\n\"%s\"", GET_TID(), func, buffer);
 }
 
-void dev_log_info_v(int v, const char *func, const char *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
+void dev_vlog_info_v(int v, const char *func, const char *fmt, va_list args) {
     char buffer[2048];
     vsnprintf(buffer, sizeof(buffer), fmt, args);
-    va_end(args);
     // Tag the verbosity tier in-message so it's grep-able alongside CANN's
     // own [INFO] prefix.
     dlog_info(AICPU, "%lu %s [V%d]\n\"%s\"", GET_TID(), func, v, buffer);

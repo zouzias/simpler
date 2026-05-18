@@ -20,6 +20,7 @@ Usage:
 """
 
 import ctypes
+import os
 from dataclasses import dataclass, field
 from multiprocessing.shared_memory import SharedMemory
 from typing import Optional
@@ -227,57 +228,106 @@ class ChipContext:
     buffer_ptrs: dict[str, int]
 
 
+# Process-wide RTLD_GLOBAL preload registry. host_runtime.so resolves its
+# undefined HostLogger / unified_log_* (and, on sim, sim_context_*) symbols
+# against these globals, so they must be loaded — exactly once — before any
+# host_runtime.so dlopen. Keyed by path; mirrors the C++ side's old
+# std::once_flag semantics. Never closed.
+_preloaded_globals: dict[str, ctypes.CDLL] = {}
+
+
+def _preload_global(path: str) -> ctypes.CDLL:
+    """dlopen `path` with RTLD_NOW | RTLD_GLOBAL, idempotently (one CDLL per path).
+
+    Eager resolution (RTLD_NOW) mirrors the previous C++ dlopen flags and
+    surfaces any missing-symbol problem at load time rather than first use.
+    """
+    handle = _preloaded_globals.get(path)
+    if handle is None:
+        handle = ctypes.CDLL(path, mode=os.RTLD_NOW | os.RTLD_GLOBAL)
+        _preloaded_globals[path] = handle
+    return handle
+
+
 class ChipWorker:
     """Unified execution interface wrapping the host runtime C API.
 
-    The runtime library is bound once via init() and cannot be changed.
-    Devices can be set and reset independently.
+    The runtime library and target device are bound once via init() and
+    cannot be changed.
 
     Usage::
 
         worker = ChipWorker()
-        worker.init(host_path="build/lib/.../host.so",
-                    aicpu_path="build/lib/.../aicpu.so",
-                    aicore_path="build/lib/.../aicore.o")
-        worker.set_device(device_id=0)
-        worker.run(chip_callable, orch_args, block_dim=24)
-        worker.reset_device()
+        worker.init(device_id=0, bins=bins)
+        worker.prepare_callable(callable_id=0, callable=chip_callable)
+        worker.run(callable_id=0, args=orch_args, config=CallConfig(block_dim=24))
+        worker.unregister_callable(callable_id=0)
         worker.finalize()
     """
 
     def __init__(self):
         self._impl = _ChipWorker()
 
-    def init(self, host_path, aicpu_path, aicore_path, sim_context_lib_path="", log_level=1, log_info_v=5):
-        """Load host runtime library and cache platform binaries.
+    def init(self, device_id, bins, log_level=None, log_info_v=None):
+        """Attach the calling thread to ``device_id``, load the host runtime
+        library, and cache platform binaries.
 
-        Can only be called once — the runtime cannot be changed.
+        Can only be called once — the runtime and device cannot be changed
+        after init.
+
+        Performs the process-wide RTLD_GLOBAL bootstrap (libsimpler_log.so,
+        plus libcpu_sim_context.so on sim platforms) and seeds the HostLogger
+        via ``simpler_log_init`` *before* the C++ ``_ChipWorker.init`` dlopens
+        host_runtime.so — host_runtime.so resolves its undefined HostLogger /
+        unified_log_* (and, on sim, sim_context_*) symbols against those
+        globals, and any LOG_* macro firing during its dlopen-time
+        constructors must already see the right filter.
 
         Args:
-            host_path: Path to the host runtime shared library (.so).
-            aicpu_path: Path to the AICPU binary (.so).
-            aicore_path: Path to the AICore binary (.o).
-            sim_context_lib_path: Path to libcpu_sim_context.so (sim only).
-            log_level: Severity floor (0=DEBUG..4=NUL). Forwarded to simpler_init().
-            log_info_v: INFO verbosity threshold (0..9). Forwarded to simpler_init().
+            device_id: NPU device ID to attach the calling thread to.
+            bins: A `simpler_setup.runtime_builder.RuntimeBinaries` (or any
+                object exposing host_path / aicpu_path / aicore_path /
+                simpler_log_path / sim_context_path).
+            log_level: Severity floor (0=DEBUG..4=NUL). Defaults to a snapshot
+                of the simpler logger via `_log.get_current_config()`.
+            log_info_v: INFO verbosity threshold (0..9). Same default.
+
+        For tests that need to drive the binding directly with arbitrary path
+        strings (e.g. to assert dlopen failure on `/nonexistent/foo.so`), call
+        `_ChipWorker.init(...)` from `_task_interface` instead of going
+        through this wrapper.
         """
+        if log_level is None or log_info_v is None:
+            from . import _log  # noqa: PLC0415
+
+            sev, info_v = _log.get_current_config()
+            if log_level is None:
+                log_level = sev
+            if log_info_v is None:
+                log_info_v = info_v
+
+        # 1. libsimpler_log.so — RTLD_GLOBAL singleton, before host_runtime.so.
+        if not bins.simpler_log_path:
+            raise ValueError("ChipWorker.init: bins.simpler_log_path is required")
+        log_handle = _preload_global(str(bins.simpler_log_path))
+        log_handle.simpler_log_init.argtypes = [ctypes.c_int, ctypes.c_int]
+        log_handle.simpler_log_init.restype = ctypes.c_int
+        rc = log_handle.simpler_log_init(int(log_level), int(log_info_v))
+        if rc != 0:
+            raise RuntimeError(f"simpler_log_init failed with code {rc}")
+
+        # 2. libcpu_sim_context.so — sim platforms only (host_runtime.so's sim
+        #    variant resolves sim_context_set_* / pto_sim_get_* against it).
+        if bins.sim_context_path:
+            _preload_global(str(bins.sim_context_path))
+
+        # 3. host_runtime.so is dlopen'd RTLD_LOCAL inside _impl.init.
         self._impl.init(
-            str(host_path), str(aicpu_path), str(aicore_path), str(sim_context_lib_path), log_level, log_info_v
+            str(bins.host_path),
+            str(bins.aicpu_path),
+            str(bins.aicore_path),
+            int(device_id),
         )
-
-    def set_device(self, device_id):
-        """Set the target NPU device.
-
-        Requires init() first. Can be called after reset_device() to switch devices.
-
-        Args:
-            device_id: NPU device ID.
-        """
-        self._impl.set_device(device_id)
-
-    def reset_device(self):
-        """Release device resources. The runtime binding remains intact."""
-        self._impl.reset_device()
 
     def finalize(self):
         """Tear down everything: device resources and runtime library.
@@ -286,11 +336,20 @@ class ChipWorker:
         """
         self._impl.finalize()
 
-    def run(self, callable, args, config=None, **kwargs):
-        """Execute a callable synchronously.
+    def prepare_callable(self, callable_id, callable):
+        """Stage a ChipCallable under ``callable_id`` for repeated cheap launches.
+
+        Uploads the kernel binaries + the orchestration SO once; subsequent
+        ``run(callable_id, ...)`` skips that work. ``callable_id``
+        must be in ``[0, 64)``. Requires ``init()``.
+        """
+        self._impl.prepare_callable(int(callable_id), callable)
+
+    def run(self, callable_id, args, config=None, **kwargs):
+        """Launch a ``callable_id`` previously staged via ``prepare_callable``.
 
         Args:
-            callable: ChipCallable built from orchestration + kernel binaries.
+            callable_id: Stable id passed to a prior ``prepare_callable``.
             args: ChipStorageTaskArgs for this invocation.
             config: Optional CallConfig. If None, a default is created.
             **kwargs: Overrides applied to config (e.g. block_dim=24).
@@ -299,7 +358,21 @@ class ChipWorker:
             config = CallConfig()
         for k, v in kwargs.items():
             setattr(config, k, v)
-        self._impl.run(callable, args, config)
+        self._impl.run(int(callable_id), args, config)
+
+    def unregister_callable(self, callable_id):
+        """Drop prepared state for ``callable_id`` and release its orch SO share."""
+        self._impl.unregister_callable(int(callable_id))
+
+    @property
+    def aicpu_dlopen_count(self):
+        """Number of distinct callable_ids the AICPU has dlopened for."""
+        return self._impl.aicpu_dlopen_count
+
+    @property
+    def host_dlopen_count(self):
+        """Number of host-side orch SO dlopens (host_build_graph variants)."""
+        return self._impl.host_dlopen_count
 
     def malloc(self, size):
         """Allocate memory. Returns a pointer (uint64)."""
@@ -361,8 +434,12 @@ class ChipWorker:
         cfg: ChipBootstrapConfig,
         channel: Optional[ChipBootstrapChannel] = None,
     ) -> ChipBootstrapResult:
-        """One-shot per-chip bootstrap: set device, build communicator, slice window,
+        """One-shot per-chip bootstrap: build communicator, slice window,
         stage inputs from host shared memory, and (optionally) publish the result.
+
+        The target device must already be attached via ``init(bins, device_id)``
+        before invoking this method; ``device_id`` is supplied here only to
+        catch a caller that wired up the wrong device on the wrong worker.
 
         Runs inside a forked chip child.  If ``channel`` is provided (the
         Worker-orchestrated integration path), the result is written as
@@ -400,7 +477,11 @@ class ChipWorker:
                             f"matching HostBufferStaging in host_outputs; none found"
                         ) from None
 
-            self.set_device(device_id)
+            if self.device_id != device_id:
+                raise RuntimeError(
+                    f"bootstrap_context(device_id={device_id}) called on a ChipWorker "
+                    f"already initialized for device_id={self.device_id}"
+                )
 
             device_ctx = 0
             local_base = 0
@@ -489,7 +570,3 @@ class ChipWorker:
     @property
     def initialized(self):
         return self._impl.initialized
-
-    @property
-    def device_set(self):
-        return self._impl.device_set

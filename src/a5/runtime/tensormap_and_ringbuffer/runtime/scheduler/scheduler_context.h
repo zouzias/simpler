@@ -11,12 +11,12 @@
 #ifndef SCHEDULER_CONTEXT_H
 #define SCHEDULER_CONTEXT_H
 
-#include "aicpu/device_log.h"
+#include "common/unified_log.h"
 #include "scheduler_types.h"
 
 #include "scheduler/pto_scheduler.h"
 
-#include "pto_completion_ingress.h"
+#include "aicore_completion_mailbox.h"
 
 // These macros are defined in runtime.h, but we cannot include it here
 // (it pulls in Handshake which we only forward-declare).  Mirror the
@@ -127,7 +127,7 @@ private:
     // the same runtime lifetime as payload_per_core_, but is kept out of the
     // dispatch payload so normal task dispatch layout and cache footprint stay
     // unchanged.
-    PTO2DeferredCompletionIngressBuffer deferred_ingress_per_core_[RUNTIME_MAX_WORKER][2];
+    DeferredCompletionSlab deferred_slab_per_core_[RUNTIME_MAX_WORKER][2];
 
     // sync_start drain coordination
     SyncStartDrainState drain_state_;
@@ -201,6 +201,21 @@ private:
     // =========================================================================
 
     static const char *shape_name(PTO2ResourceShape shape);
+
+    // Lower-case rendering of PTO2SubtaskSlot, used by dispatch and stall logs.
+    // Kept lower-case to match the `kernels=[aic:N aiv0:N aiv1:N]` field
+    // convention already established in the stall log family.
+    static inline const char *subslot_name(PTO2SubtaskSlot s) {
+        switch (s) {
+        case PTO2SubtaskSlot::AIC:
+            return "aic";
+        case PTO2SubtaskSlot::AIV0:
+            return "aiv0";
+        case PTO2SubtaskSlot::AIV1:
+            return "aiv1";
+        }
+        return "?";
+    }
     static const PTO2ResourceShape *get_dispatch_order(int32_t thread_idx);
 
     int pop_ready_tasks_batch(
@@ -280,8 +295,13 @@ private:
     __attribute__((noinline, cold)) void
     log_stall_diagnostics(int32_t thread_idx, int32_t task_count, int32_t idle_iterations, int32_t last_progress_count);
 
+    // Reverse lookup: given a global core_id, find which scheduler thread's
+    // tracker owns it. Returns -1 if not found. Linear scan — only used on
+    // the cold diagnostic path.
+    int32_t find_core_owner_thread(int32_t core_id) const;
+
     __attribute__((noinline, cold)) int32_t handle_timeout_exit(
-        int32_t thread_idx, int32_t idle_iterations
+        int32_t thread_idx, PTO2SharedMemoryHeader *header, Runtime *runtime, int32_t idle_iterations
 #if PTO2_PROFILING
         ,
         uint64_t sched_start_ts
@@ -298,7 +318,7 @@ private:
 
     uint64_t get_function_bin_addr(int func_id) const {
         if (!func_id_to_addr_ || func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) {
-            DEV_ERROR("func_id=%d is out of range [0, %d) or map is null", func_id, RUNTIME_MAX_FUNC_ID);
+            LOG_ERROR("func_id=%d is out of range [0, %d) or map is null", func_id, RUNTIME_MAX_FUNC_ID);
             return 0;
         }
         return func_id_to_addr_[func_id];

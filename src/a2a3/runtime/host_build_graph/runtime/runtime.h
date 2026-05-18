@@ -35,6 +35,7 @@
 #include <string.h>  // for memset
 
 #include <atomic>
+#include <vector>
 
 #include "common/core_type.h"
 #include "common/l2_perf_profiling.h"
@@ -63,10 +64,6 @@
 
 #ifndef RUNTIME_MAX_WORKER
 #define RUNTIME_MAX_WORKER PLATFORM_MAX_CORES_PER_THREAD
-#endif
-
-#ifndef RUNTIME_MAX_TENSOR_PAIRS
-#define RUNTIME_MAX_TENSOR_PAIRS 64
 #endif
 
 #ifndef RUNTIME_MAX_FUNC_ID
@@ -102,32 +99,21 @@
  * The structure is cache-line aligned (64 bytes) to prevent false sharing
  * between cores and optimize cache coherency operations.
  *
- * enable_profiling_flag bit definitions (umbrella bitmask — "profiling"
- * is the umbrella, each bit is a parallel diagnostics sub-feature):
- * - bit0: tensor dump enabled
- * - bit1: L2 swimlane enabled
- * - bit2: PMU enabled
- *
  * Field Access Patterns:
  * - aicpu_ready: Written by AICPU, read by AICore
  * - aicore_done: Written by AICore, read by AICPU
  * - task: Written by AICPU, read by AICore (0 = no task assigned)
  * - core_type: Written by AICPU, read by AICore (CoreType::AIC or CoreType::AIV)
- * - l2_perf_records_addr: Written by AICPU, read by AICore (performance records address)
  * - physical_core_id: Written by AICPU, read by AICore (physical core ID)
- * - enable_profiling_flag: Written by host/AICPU init, read by AICore (bitmask)
  */
 struct Handshake {
-    volatile uint32_t aicpu_ready;           // AICPU ready signal: 0=not ready, 1=ready
-    volatile uint32_t aicore_done;           // AICore ready signal: 0=not ready, core_id+1=ready
-    volatile uint64_t task;                  // Task pointer: 0=no task, non-zero=Task* address
-    volatile CoreType core_type;             // Core type: CoreType::AIC or CoreType::AIV
-    volatile uint64_t l2_perf_records_addr;  // Performance records address
-    volatile uint32_t physical_core_id;      // Physical core ID
-    volatile uint32_t aicpu_regs_ready;      // AICPU register init done: 0=pending, 1=done
-    volatile uint32_t aicore_regs_ready;     // AICore ID reported: 0=pending, 1=done
-    volatile uint32_t
-        enable_profiling_flag;  // Umbrella diagnostics bitmask; bit0=dump_tensor, bit1=l2_swimlane, bit2=pmu
+    volatile uint32_t aicpu_ready;        // AICPU ready signal: 0=not ready, 1=ready
+    volatile uint32_t aicore_done;        // AICore ready signal: 0=not ready, core_id+1=ready
+    volatile uint64_t task;               // Task pointer: 0=no task, non-zero=Task* address
+    volatile CoreType core_type;          // Core type: CoreType::AIC or CoreType::AIV
+    volatile uint32_t physical_core_id;   // Physical core ID
+    volatile uint32_t aicpu_regs_ready;   // AICPU register init done: 0=pending, 1=done
+    volatile uint32_t aicore_regs_ready;  // AICore ID reported: 0=pending, 1=done
 } __attribute__((aligned(64)));
 
 /**
@@ -149,8 +135,19 @@ struct HostApi {
     void (*device_free)(void *dev_ptr);
     int (*copy_to_device)(void *dev_ptr, const void *host_ptr, size_t size);
     int (*copy_from_device)(void *host_ptr, const void *dev_ptr, size_t size);
-    uint64_t (*upload_kernel_binary)(int func_id, const uint8_t *bin_data, size_t bin_size);
-    void (*remove_kernel_binary)(int func_id);
+    // Single-shot upload of the entire ChipCallable buffer. `callable` is a
+    // `const ChipCallable *` (declared void* to avoid pulling task_interface
+    // headers into runtime.h). DeviceRunner walks child_offsets_ to compute
+    // total byte size, allocates device GM once, fixes up each child's
+    // resolved_addr_ in an internal host scratch (onboard: device addr; sim:
+    // dlopen function pointer), H2D's once, and returns the device-side
+    // address of the ChipCallable header. Pool-managed: identical buffer
+    // contents (FNV-1a 64-bit) hit the dedup cache; all chip buffers are
+    // bulk-freed in DeviceRunner::finalize(). Returns 0 on error or when
+    // child_count() == 0. Caller computes child addrs as
+    //     chip_dev + offsetof(ChipCallable, storage_) + child_offset(i)
+    // and stores them via runtime->set_function_bin_addr(fid, child_dev).
+    uint64_t (*upload_chip_callable_buffer)(const void *callable);
 };
 
 /**
@@ -216,10 +213,6 @@ private:
     int initial_ready_tasks[RUNTIME_MAX_TASKS];
     int initial_ready_count;
 
-    // Tensor pairs for host-device memory tracking
-    TensorPair tensor_pairs[RUNTIME_MAX_TENSOR_PAIRS];
-    int tensor_pair_count;
-
     // Function address mapping (for API compatibility with rt2)
     uint64_t func_id_to_addr_[RUNTIME_MAX_FUNC_ID];
 
@@ -243,9 +236,6 @@ public:
      * Constructor - zero-initialize all arrays
      */
     Runtime();
-
-    // Orchestration is always built on the host for this runtime
-    bool get_orch_built_on_host() const { return true; }
 
     // =========================================================================
     // Task Management
@@ -315,38 +305,6 @@ public:
      * Shows task table with fanin/fanout information.
      */
     void print_runtime() const;
-
-    // =========================================================================
-    // Tensor Pair Management
-    // =========================================================================
-
-    /**
-     * Record a host-device tensor pair for copy-back during finalize.
-     *
-     * @param host_ptr  Host memory pointer (destination for copy-back)
-     * @param dev_ptr   Device memory pointer (source for copy-back)
-     * @param size     Size of tensor in bytes
-     */
-    void record_tensor_pair(void *host_ptr, void *dev_ptr, size_t size);
-
-    /**
-     * Get pointer to tensor pairs array.
-     *
-     * @return Pointer to tensor pairs array
-     */
-    TensorPair *get_tensor_pairs();
-
-    /**
-     * Get number of recorded tensor pairs.
-     *
-     * @return Number of tensor pairs
-     */
-    int get_tensor_pair_count() const;
-
-    /**
-     * Clear all recorded tensor pairs.
-     */
-    void clear_tensor_pairs();
 
     // =========================================================================
     // Tensor Info Metadata
@@ -445,6 +403,19 @@ public:
      */
     void set_function_bin_addr(int func_id, uint64_t addr);
 
+    /**
+     * Replay a previously-uploaded kernel address onto a fresh Runtime
+     * without recording it in registered_kernel_func_ids_. Used by
+     * DeviceRunner::bind_prepared_callable_to_runtime when restoring kernels
+     * across run_prepared invocations: the prepared callable owns the
+     * kernel binaries' device memory until unregister, so
+     * validate_runtime_impl must NOT free them.
+     */
+    void replay_function_bin_addr(int func_id, uint64_t addr) {
+        if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) return;
+        func_id_to_addr_[func_id] = addr;
+    }
+
     int get_registered_kernel_count() const { return registered_kernel_count_; }
 
     int get_registered_kernel_func_id(int index) const {
@@ -462,24 +433,60 @@ public:
     // NOTE: Placed at end of class to avoid affecting device memory layout
     HostApi host_api;
 
-    // Device orchestration SO metadata: device buffer + dirty flag (host
+    // Device orchestration SO metadata: device buffer pointer + size (host
     // populates these via DeviceRunner::prepare_orch_so before launch).
     // host_build_graph runtime variant currently does not load device
     // orchestration SOs, but DeviceRunner is shared with the other variants
     // and unconditionally writes these fields, so they must exist.
     uint64_t dev_orch_so_addr_{0};
     uint64_t dev_orch_so_size_{0};
-    bool has_new_orch_so_{false};
 
-    // Host-only staging fields (mirror tensormap_and_ringbuffer variant).
-    const void *pending_orch_so_data_{nullptr};
-    size_t pending_orch_so_size_{0};
+    // Per-callable_id dispatch. hbg orch runs on host, so AICPU never reads
+    // `active_callable_id_`; the field exists for parity with the
+    // shared platform layer (DeviceRunner stamps it on every run).
+    int32_t active_callable_id_{-1};
+    bool register_new_callable_id_{false};
 
-    void set_dev_orch_so(uint64_t dev_addr, uint64_t size, bool is_new) {
+    // Device-orchestration entry/config symbol names (trb path). Always
+    // empty on this hbg variant — included for API parity so the shared
+    // platform layer can call set_device_orch_func_name unconditionally.
+    char device_orch_func_name_[64]{};
+    char device_orch_config_name_[64]{};
+
+    void set_device_orch_func_name(const char *name) {
+        device_orch_func_name_[0] = '\0';
+        if (name) {
+            strncpy(device_orch_func_name_, name, sizeof(device_orch_func_name_) - 1);
+            device_orch_func_name_[sizeof(device_orch_func_name_) - 1] = '\0';
+        }
+    }
+    const char *get_device_orch_func_name() const { return device_orch_func_name_; }
+    void set_device_orch_config_name(const char *name) {
+        device_orch_config_name_[0] = '\0';
+        if (name) {
+            strncpy(device_orch_config_name_, name, sizeof(device_orch_config_name_) - 1);
+            device_orch_config_name_[sizeof(device_orch_config_name_) - 1] = '\0';
+        }
+    }
+    const char *get_device_orch_config_name() const { return device_orch_config_name_; }
+
+    void set_dev_orch_so(uint64_t dev_addr, uint64_t size) {
         dev_orch_so_addr_ = dev_addr;
         dev_orch_so_size_ = size;
-        has_new_orch_so_ = is_new;
     }
+    void set_active_callable_id(int32_t callable_id, bool is_new) {
+        active_callable_id_ = callable_id;
+        register_new_callable_id_ = is_new;
+    }
+    int32_t get_active_callable_id() const { return active_callable_id_; }
+    bool register_new_callable_id() const { return register_new_callable_id_; }
+
+    // Host-side tensor ledger for D2H copy-back at finalize. Populated by
+    // runtime_maker.cpp from orch_args at bind time; iterated in
+    // validate_runtime_impl. Not read by AICPU/AICore — the device-side
+    // Runtime image carries the std::vector control block as harmless
+    // garbage, identical to host_api above. No fixed cap.
+    std::vector<TensorPair> tensor_pairs_;
 };
 
 #endif  // SRC_A2A3_RUNTIME_HOST_BUILD_GRAPH_RUNTIME_RUNTIME_H_

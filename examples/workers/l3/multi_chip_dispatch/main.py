@@ -31,7 +31,7 @@ import sys
 
 # Workaround for the duplicate-libomp abort when homebrew numpy and pip torch
 # coexist in one macOS process. Harmless on Linux. Must be set before
-# ``import torch``. See docs/macos-libomp-collision.md.
+# ``import torch``. See docs/troubleshooting/macos-libomp-collision.md.
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import torch  # noqa: E402
@@ -146,6 +146,9 @@ def run(platform: str, device_ids: list[int]) -> int:
     print(f"[multi_chip_dispatch] compiling kernels for {platform}...")
     chip_callable = build_chip_callable(platform)
 
+    # Register the ChipCallable so submit_next_level takes a cid.
+    chip_cid = worker.register(chip_callable)
+
     # --- 5. init() forks chip + sub child processes, starts C++ scheduler.
     print("[multi_chip_dispatch] init worker...")
     worker.init()
@@ -165,7 +168,7 @@ def run(platform: str, device_ids: list[int]) -> int:
                 chip_args.add_tensor(make_tensor_arg(host_a[i]), TensorArgType.INPUT)
                 chip_args.add_tensor(make_tensor_arg(host_b[i]), TensorArgType.INPUT)
                 chip_args.add_tensor(make_tensor_arg(host_out[i]), TensorArgType.OUTPUT_EXISTING)
-                orch.submit_next_level(chip_callable, chip_args, cfg, worker=i)
+                orch.submit_next_level(chip_cid, chip_args, cfg, worker=i)
 
             # Sub task that depends on both chip outputs. Tagging the two
             # host_out[i] tensors INPUT tells the scheduler to wait for

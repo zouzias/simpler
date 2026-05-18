@@ -30,8 +30,6 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from .device_log_resolver import infer_device_id_from_log_path, resolve_device_log_path
-from .sched_overhead_analysis import parse_scheduler_threads
 from .sched_overhead_analysis import run_analysis as run_sched_overhead_analysis
 
 
@@ -117,6 +115,61 @@ def read_perf_data(filepath):
     return data
 
 
+def load_deps_json(perf_records_path):
+    """Load deps.json (dep_gen replay output) co-located with ``l2_perf_records.json``.
+
+    deps.json supersedes ``task["fanout"]``: fanout is sealed at the moment the
+    producer's L2PerfRecord retires, so consumers submitted after a fast producer
+    completes can never get attributed to it. dep_gen's replay reconstructs the
+    complete graph by replaying every captured ``submit_task`` through a host
+    PTO2TensorMap.
+
+    Returns:
+        dict[int, list[int]] mapping ``pred_raw → [succ_raw, ...]`` (i.e. the
+        same shape as ``task["fanout"]``), or ``None`` if no deps.json is present.
+        Tasks with no successors are absent from the dict (mirrors ``defaultdict``
+        semantics on lookup miss).
+    """
+    deps_path = Path(perf_records_path).parent / "deps.json"
+    if not deps_path.exists():
+        return None
+    try:
+        with deps_path.open() as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"Warning: failed to read {deps_path}: {e}; falling back to fanout", file=sys.stderr)
+        return None
+    edges = data.get("edges")
+    if not isinstance(edges, list):
+        return None
+    version = data.get("version")
+    if version != 2:
+        print(
+            f"Warning: deps.json version={version!r}; only v2 is supported. Falling back to fanout[].",
+            file=sys.stderr,
+        )
+        return None
+    # The converter only needs flow-event endpoints (not the per-edge tensor
+    # annotations). Project annotated edges down to a (pred, succ) set and
+    # dedup so multiple annotated edges sharing the same pair (distinct arg
+    # / source / overlap) collapse to a single flow event.
+    by_pred: dict[int, list[int]] = defaultdict(list)
+    seen: set[tuple[int, int]] = set()
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        pred = normalize_pto2_task_id_int(edge.get("pred"))
+        succ = normalize_pto2_task_id_int(edge.get("succ"))
+        if pred is None or succ is None:
+            continue
+        key = (pred, succ)
+        if key in seen:
+            continue
+        seen.add(key)
+        by_pred[pred].append(succ)
+    return dict(by_pred)
+
+
 def load_kernel_config(config_path):
     """Load kernel configuration from kernel_config.py file.
 
@@ -188,48 +241,7 @@ def load_func_names_json(json_path):
     return data.get("callable_id_to_name", {}), data.get("orchestrator_name")
 
 
-def parse_sched_cpu_from_device_log(log_path, task_count):
-    """Parse device log for PTO2 scheduler stats and return scheduler CPU time per task (us).
-
-    Looks for lines like: "Thread N: completed=X tasks in Yus (Z loops, W tasks/loop)"
-    Sums the 'total_us' values (one per scheduler thread, typically 3) and divides by task_count.
-
-    Returns:
-        float: scheduler_us_per_task, or None if parsing failed / file missing
-    """
-    path = Path(log_path)
-    if not path.exists() or task_count <= 0:
-        return None
-
-    try:
-        threads = parse_scheduler_threads(path)
-    except Exception:
-        return None
-
-    if not threads:
-        return None
-
-    total_sched_cpu_us = sum(t.get("total_us", 0.0) for t in threads.values())
-    if total_sched_cpu_us <= 0:
-        return None
-
-    total_completed = sum(t.get("completed", 0) for t in threads.values())
-    if task_count > 0 and total_completed > 0 and abs(total_completed - task_count) / task_count > 0.5:
-        print(
-            f"Warning: device log has {total_completed} completed tasks "
-            f"but perf JSON has {task_count}; skipping Sched CPU metric "
-            f"(device log may be from a different run)",
-            file=sys.stderr,
-        )
-        return None
-
-    return {
-        "us_per_task": total_sched_cpu_us / task_count,
-        "num_sched_threads": len(threads),
-    }
-
-
-def print_task_statistics(tasks, func_id_to_name=None, sched_info=None):
+def print_task_statistics(tasks, func_id_to_name=None):
     """Print task statistics grouped by func_id.
 
     Exec = kernel execution time (end_time_us - start_time_us) on AICore.
@@ -241,8 +253,6 @@ def print_task_statistics(tasks, func_id_to_name=None, sched_info=None):
     Args:
         tasks: List of task dicts
         func_id_to_name: Optional dict mapping func_id to function name
-        sched_info: Optional dict with 'us_per_task' (float) and 'num_sched_threads' (int),
-            parsed from device log by parse_sched_cpu_from_device_log()
     """
     # Group tasks by func_id with extended metrics
     func_stats: defaultdict[Any, dict[str, Any]] = defaultdict(
@@ -364,23 +374,7 @@ def print_task_statistics(tasks, func_id_to_name=None, sched_info=None):
             f"Avg Latency (dispatch->finish) = {avg_latency_us:.2f} us,  "
             f"Exec/Latency = {exec_latency_ratio_pct:.2f}%"
         )
-        if sched_info is not None:
-            sched_cpu = sched_info["us_per_task"]
-            num_cores = len(set(t["core_id"] for t in tasks))
-            exec_sched_ratio = (avg_exec_us / sched_cpu * 100) if sched_cpu > 0 else 0
-            per_core_exec = avg_exec_us / num_cores if num_cores > 0 else 0
-            per_core_ratio = (per_core_exec / sched_cpu * 100) if sched_cpu > 0 else 0
-            num_threads = sched_info["num_sched_threads"]
-            print(
-                f"  Sched CPU (from device log): {sched_cpu:.2f} us/task  "
-                f"(Exec/Sched = {exec_sched_ratio:.1f}%, PerCore/Sched = {per_core_ratio:.1f}%)"
-            )
-            print(
-                f"  (Latency = dispatch→finish; Sched CPU = scheduler thread CPU per task; "
-                f"PerCore = avg_exec/{num_cores}_cores vs sched_cpu, {num_threads} sched threads)"
-            )
-        else:
-            print("  (Latency = dispatch→finish; Sched CPU = scheduler thread CPU per task)")
+        print("  (Latency = dispatch→finish; Exec = AICore kernel time per task)")
 
     print("=" * 110)
 
@@ -391,10 +385,10 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
     func_id_to_name=None,
     verbose=False,
     scheduler_phases=None,
-    orchestrator_data=None,
     orchestrator_phases=None,
     core_to_thread=None,
     orchestrator_name=None,
+    deps_edges=None,
 ):
     """Generate Chrome Trace Event Format JSON from task data.
 
@@ -409,7 +403,6 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
         func_id_to_name: Optional dict mapping func_id to function name
         verbose: Print progress information
         scheduler_phases: Optional list of per-thread phase record lists (version 2)
-        orchestrator_data: Optional dict with orchestrator summary (version 2)
         orchestrator_phases: Optional list of per-task orchestrator phase records (version 2)
         core_to_thread: Optional list mapping core_id (index) to scheduler thread index (-1 = unassigned)
 
@@ -627,11 +620,22 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
             task_to_aicpu_event_id[(task["task_id"], task["core_id"])] = event_id
             event_id += 1
 
-    # Flow events (Flow events "s" and "f" for dependencies)
+    # Flow events (Flow events "s" and "f" for dependencies). When deps.json
+    # was produced by dep_gen replay, prefer its edges over task["fanout"] —
+    # fanout is the truncated, race-prone view (see load_deps_json's docstring).
+    # Edges where the predecessor's end_time outlives the successor's start_time
+    # are flagged as happens-before violations and emitted with a distinct flow
+    # name so Perfetto colors them differently from clean dependency arrows.
     task_map: dict[int, list] = defaultdict(list)
     for t in tasks:
         task_map[t["task_id"]].append(t)
     flow_id = 0
+    hb_violation_count = 0
+
+    def _succs_for(task):
+        if deps_edges is not None:
+            return deps_edges.get(task["task_id"], [])
+        return task["fanout"]
 
     for task in tasks:
         src_tid = core_to_tid[task["core_id"]]
@@ -642,7 +646,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
         # Use a small offset (0.01 us) for visual clarity
         flow_start_us = src_ts_end - 0.01
 
-        for succ_task_id in task["fanout"]:
+        for succ_task_id in _succs_for(task):
             if succ_task_id not in task_map:
                 if verbose:
                     print(
@@ -656,12 +660,21 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                 dst_ts_start = succ_task["start_time_us"]
                 dst_event_id = task_to_event_id[(succ_task["task_id"], succ_task["core_id"])]
 
+                # Happens-before violation: producer outlived consumer's start.
+                # Real time order broke the data dependency the graph asserted;
+                # the runtime got away with it (consumer presumably re-read fresh
+                # data) but it's a smell — surface it.
+                hb_violated = src_ts_end > dst_ts_start
+                flow_name = "hb_violation" if hb_violated else "dependency"
+                if hb_violated:
+                    hb_violation_count += 1
+
                 # Flow start event (at end of source task)
                 events.append(
                     {
                         "cat": "flow",
                         "id": flow_id,
-                        "name": "dependency",
+                        "name": flow_name,
                         "ph": "s",
                         "pid": 1,
                         "tid": src_tid,
@@ -674,7 +687,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                     {
                         "cat": "flow",
                         "id": flow_id,
-                        "name": "dependency",
+                        "name": flow_name,
                         "ph": "f",
                         "pid": 1,
                         "tid": dst_tid,
@@ -684,6 +697,12 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                     }
                 )
                 flow_id += 1
+
+    if verbose:
+        edge_source = "deps.json" if deps_edges is not None else "task.fanout"
+        print(f"  Flow events: {flow_id} edges (source: {edge_source})")
+        if hb_violation_count > 0:
+            print(f"  Happens-before violations: {hb_violation_count} edge(s) flagged as 'hb_violation'")
 
     # AICPU Scheduler phase events (version 2)
     if scheduler_phases:
@@ -743,7 +762,12 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                 events.append(event)
 
     # AICPU Orchestrator event (version 2)
-    if orchestrator_phases or orchestrator_data:
+    #
+    # Per-event AicpuPhaseRecord[] are the single source of truth. The
+    # cumulative aicpu_orchestrator summary still ships start/end_time and
+    # submit_count but no per-phase breakdown — anything that needs phase
+    # totals derives them by bucketing per-event entries on phase_id.
+    if orchestrator_phases:
         # Process metadata
         orch_process_label = f"AICPU {orchestrator_name}" if orchestrator_name else "AICPU Orchestrator"
         events.append(
@@ -753,30 +777,14 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
             {"args": {"sort_index": 1}, "cat": "__metadata", "name": "process_sort_index", "ph": "M", "pid": 4}
         )
 
-        # Normalize orchestrator_phases: support both per-thread nested format
-        # (list of lists) and legacy flat format (list of dicts)
-        orch_threads = orchestrator_phases if orchestrator_phases else []
-
         # Thread name metadata for each orchestrator thread
-        for orch_idx in range(len(orch_threads)):
+        for orch_idx in range(len(orchestrator_phases)):
             tid = 4000 + orch_idx
             name = f"Orch_{orch_idx}"
             events.append(
                 {"args": {"name": name}, "cat": "__metadata", "name": "thread_name", "ph": "M", "pid": 4, "tid": tid}
             )
-        if not orch_threads and orchestrator_data:
-            events.append(
-                {
-                    "args": {"name": orchestrator_name or "Orchestrator"},
-                    "cat": "__metadata",
-                    "name": "thread_name",
-                    "ph": "M",
-                    "pid": 4,
-                    "tid": 4000,
-                }
-            )
 
-    if orchestrator_phases:
         # Per-task orchestrator phase bars
         orch_phase_colors = {
             "orch_sync": "thread_state_iowait",  # orange
@@ -790,7 +798,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
             "orch_scope_end": "generic_work",
         }
 
-        for orch_idx, thread_records in enumerate(orch_threads):
+        for orch_idx, thread_records in enumerate(orchestrator_phases):
             tid = 4000 + orch_idx
             for record in thread_records:
                 phase = record.get("phase", "unknown")
@@ -822,39 +830,6 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                 }
                 events.append(event)
 
-    elif orchestrator_data:
-        # Fallback: cumulative summary as single bar
-        orch_start = orchestrator_data["start_time_us"]
-        orch_end = orchestrator_data["end_time_us"]
-        orch_dur = orch_end - orch_start
-        phase_us = orchestrator_data.get("phase_us", {})
-
-        # Build args with phase breakdown (cumulative totals, shown in detail panel)
-        orch_args = {
-            "submit_count": orchestrator_data.get("submit_count", 0),
-        }
-        total_phase_us = sum(phase_us.values())
-        if total_phase_us > 0:
-            for phase_name, dur in phase_us.items():
-                if dur > 0:
-                    pct = dur / total_phase_us * 100
-                    orch_args[f"{phase_name}_us"] = round(dur, 3)
-                    orch_args[f"{phase_name}_%"] = round(pct, 1)
-
-        # Total orchestrator bar
-        events.append(
-            {
-                "args": orch_args,
-                "cat": "orchestrator",
-                "name": f"Orchestrator({orchestrator_data.get('submit_count', 0)} tasks)",
-                "ph": "X",
-                "pid": 4,
-                "tid": 4000,
-                "ts": orch_start,
-                "dur": orch_dur,
-            }
-        )
-
     # AICPU View fanout arrows (duplicate AICore View flow events using AICPU timestamps)
     if has_aicpu_data:
         for task in tasks:
@@ -866,7 +841,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
             src_tid = task_to_aicpu_tid.get((task["task_id"], task["core_id"]), core_to_tid[task["core_id"]])
             src_aicpu_eid = task_to_aicpu_event_id.get((task["task_id"], task["core_id"]))
 
-            for succ_task_id in task["fanout"]:
+            for succ_task_id in _succs_for(task):
                 if succ_task_id not in task_map:
                     continue
 
@@ -880,10 +855,15 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                     )
                     dst_aicpu_eid = task_to_aicpu_event_id.get((succ_task["task_id"], succ_task["core_id"]))
 
+                    # Mirror the AICore-view HB-violation classification using
+                    # the AICPU dispatch/finish timestamps.
+                    aicpu_hb_violated = src_finish_us > dst_dispatch_us
+                    aicpu_flow_name = "hb_violation" if aicpu_hb_violated else "dependency"
+
                     flow_s = {
                         "cat": "flow",
                         "id": flow_id,
-                        "name": "dependency",
+                        "name": aicpu_flow_name,
                         "ph": "s",
                         "pid": 2,
                         "tid": src_tid,
@@ -896,7 +876,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                     flow_f = {
                         "cat": "flow",
                         "id": flow_id,
-                        "name": "dependency",
+                        "name": aicpu_flow_name,
                         "ph": "f",
                         "pid": 2,
                         "tid": dst_tid,
@@ -1019,7 +999,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
     if orchestrator_phases and scheduler_phases:
         orch_fanin_by_task = {}
         orch_params_by_task = {}
-        for orch_idx, thread_records in enumerate(orch_threads):
+        for orch_idx, thread_records in enumerate(orchestrator_phases):
             for record in thread_records:
                 phase = record.get("phase")
                 task_id = record.get("task_id", -1)
@@ -1110,7 +1090,6 @@ Examples:
   %(prog)s l2_perf_records_20260210_143526.json   # Output: outputs/merged_swimlane_20260210_143526.json
   %(prog)s l2_perf_records_20260210_143526.json -o custom_output.json
   %(prog)s l2_perf_records_20260210_143526.json -k examples/host_build_graph/paged_attention/kernels/kernel_config.py
-  %(prog)s l2_perf_records_20260210_143526.json -d 0
   %(prog)s l2_perf_records_20260210_143526.json -v
         """,
     )
@@ -1129,8 +1108,6 @@ Examples:
         "--func-names",
         help="Path to func_id_names_*.json (SceneTest format) for func_id to function name mapping",
     )
-    parser.add_argument("--device-log", help="Device log file/path/glob override used for scheduler analysis")
-    parser.add_argument("-d", "--device-id", help="Device id for auto-selection from device-<id>")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     return parser
 
@@ -1199,19 +1176,6 @@ def _print_verbose_data_info(data, verbose):
         print(f"  Core-to-thread mapping: {len(core_to_thread)} cores")
 
 
-def _report_device_log(resolved_device_log, log_strategy):
-    """Print device log resolution result."""
-    if resolved_device_log is not None:
-        print(f"\nDevice log: {resolved_device_log}")
-        print(f"Selection: {log_strategy}")
-        inferred_device_id = infer_device_id_from_log_path(resolved_device_log)
-        if inferred_device_id is not None:
-            print(f"Inferred Device ID: {inferred_device_id}")
-    else:
-        print("\nDevice log: (not resolved)")
-        print(f"Selection: {log_strategy}")
-
-
 def _load_func_names(args):
     """Load func_id→name mapping from --func-names JSON or -k kernel_config.py.
 
@@ -1262,11 +1226,9 @@ def main():
 
         output_path = _resolve_output_path(args, input_path)
 
-        resolved_device_log, log_strategy = resolve_device_log_path(
-            device_id=args.device_id,
-            device_log=args.device_log,
-            l2_perf_records_path=input_path,
-        )
+        deps_edges = load_deps_json(input_path)
+        if args.verbose and deps_edges is not None:
+            print(f"  Using deps.json edges ({sum(len(v) for v in deps_edges.values())} total)")
 
         generate_chrome_trace_json(
             data["tasks"],
@@ -1275,9 +1237,9 @@ def main():
             args.verbose,
             orchestrator_name=orchestrator_name,
             scheduler_phases=data.get("aicpu_scheduler_phases"),
-            orchestrator_data=data.get("aicpu_orchestrator"),
             orchestrator_phases=data.get("aicpu_orchestrator_phases"),
             core_to_thread=data.get("core_to_thread"),
+            deps_edges=deps_edges,
         )
 
         print("\n✓ Conversion complete")
@@ -1285,33 +1247,23 @@ def main():
         print(f"  Output: {output_path}")
         print(f"\nTo visualize: Open https://ui.perfetto.dev/ and drag in {output_path}")
 
-        _report_device_log(resolved_device_log, log_strategy)
+        print_task_statistics(data["tasks"], func_names)
 
-        sched_info = None
-        if resolved_device_log is not None:
-            sched_info = parse_sched_cpu_from_device_log(resolved_device_log, len(data["tasks"]))
-            if args.verbose and sched_info is not None:
-                print(f"  Parsed sched CPU from device log: {sched_info['us_per_task']:.2f} us/task")
-
-        print_task_statistics(data["tasks"], func_names, sched_info=sched_info)
-
-        if resolved_device_log is not None:
-            print("\n=== Scheduler Overhead Deep Dive ===")
-            deep_dive_rc = run_sched_overhead_analysis(
-                input_path,
-                resolved_device_log,
-                print_sources=True,
-                selection_strategy=log_strategy,
+        # The deep-dive reads only the perf JSON and (optionally) the colocated
+        # deps.json — sibling auto-discovery happens inside run_sched_overhead_analysis.
+        print("\n=== Scheduler Overhead Deep Dive ===")
+        deep_dive_rc = run_sched_overhead_analysis(
+            input_path,
+            print_sources=True,
+            perf_data=data,
+        )
+        if deep_dive_rc != 0:
+            print(
+                "Warning: Scheduler overhead deep-dive failed; conversion output is still available. "
+                "Check the detailed error above for root cause and fix route "
+                "(typically missing aicpu_scheduler_phases — rerun with --enable-l2-swimlane).",
+                file=sys.stderr,
             )
-            if deep_dive_rc != 0:
-                print(
-                    "Warning: Scheduler overhead deep-dive failed; conversion output is still available. "
-                    "Check the detailed error above for root cause and fix route "
-                    "(typically missing dispatch_time_us/finish_time_us in perf JSON).",
-                    file=sys.stderr,
-                )
-        else:
-            print("\n[Info] Scheduler overhead deep-dive skipped (no device log resolved).")
 
         return 0
 

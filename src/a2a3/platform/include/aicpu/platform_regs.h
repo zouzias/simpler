@@ -53,7 +53,7 @@ uint64_t get_platform_regs();
 /**
  * Set the per-core PMU MMIO register base address array.
  * On hardware this is distinct from set_platform_regs (different HAL addr_type).
- * On sim this stays 0 (PMU has no hardware model).
+ * On sim this points at host-allocated memory that backs the same offsets.
  *
  * @param pmu_regs  Pointer (as uint64_t) to per-core PMU register base address array, 0 if PMU unsupported
  */
@@ -105,8 +105,9 @@ void platform_init_aicore_regs(uint64_t reg_addr);
  * This function sends exit signal and closes fast path control.
  *
  * @param reg_addr  Register base address of the AICore
+ * @return 0 if the core acknowledged exit, non-zero on timeout
  */
-void platform_deinit_aicore_regs(uint64_t reg_addr);
+int32_t platform_deinit_aicore_regs(uint64_t reg_addr);
 
 /**
  * Get physical core count for current platform

@@ -18,9 +18,13 @@
 #include "pto_runtime_c_api.h"
 
 #include "callable.h"
+#include "prepare_callable_common.h"
 #include "task_args.h"
 
 #include <pthread.h>
+
+#include <cstdlib>
+#include <utility>
 #include <vector>
 
 #include "common/unified_log.h"
@@ -39,11 +43,17 @@ extern "C" {
 /* ===========================================================================
  * Runtime Implementation Functions (defined in runtime_maker.cpp)
  * =========================================================================== */
-int init_runtime_impl(Runtime *runtime, const ChipCallable *callable, const ChipStorageTaskArgs *orch_args);
+int prepare_callable_impl(
+    const ChipCallable *callable, uint64_t (*upload_fn)(const void *), PreparedCallableArtifacts *out
+);
+int bind_prepared_to_runtime_impl(
+    Runtime *runtime, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr, const ArgDirection *signature,
+    int sig_count
+);
 int validate_runtime_impl(Runtime *runtime);
 
 /* ===========================================================================
- * Per-thread DeviceRunner binding (set by run_runtime, read by HostApi wrappers)
+ * Per-thread DeviceRunner binding (set by prepare_callable / run_prepared, read by HostApi wrappers)
  * =========================================================================== */
 
 static pthread_key_t g_runner_key;
@@ -89,18 +99,12 @@ static int copy_from_device(void *host_ptr, const void *dev_ptr, size_t size) {
     }
 }
 
-static uint64_t upload_kernel_binary_wrapper(int func_id, const uint8_t *bin_data, size_t bin_size) {
+static uint64_t upload_chip_callable_buffer_wrapper(const void *callable) {
     try {
-        return current_runner()->upload_kernel_binary(func_id, bin_data, bin_size);
+        return current_runner()->upload_chip_callable_buffer(static_cast<const ChipCallable *>(callable));
     } catch (...) {
         return 0;
     }
-}
-
-static void remove_kernel_binary_wrapper(int func_id) {
-    try {
-        current_runner()->remove_kernel_binary(func_id);
-    } catch (...) {}
 }
 
 /* ===========================================================================
@@ -118,12 +122,6 @@ DeviceContextHandle create_device_context(void) {
 void destroy_device_context(DeviceContextHandle ctx) { delete static_cast<DeviceRunner *>(ctx); }
 
 size_t get_runtime_size(void) { return sizeof(Runtime); }
-
-int set_device(DeviceContextHandle ctx, int device_id) {
-    (void)ctx;
-    (void)device_id;
-    return 0;
-}
 
 int ensure_acl_ready_ctx(DeviceContextHandle ctx, int device_id) {
     if (ctx == NULL) return -1;
@@ -192,14 +190,61 @@ int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *de
     }
 }
 
-int run_runtime(
-    DeviceContextHandle ctx, RuntimeHandle runtime, const void *callable, const void *args, int block_dim,
-    int aicpu_thread_num, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size, const uint8_t *aicore_binary,
-    size_t aicore_size, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, const char *output_prefix
-) {
-    if (ctx == NULL || runtime == NULL) return -1;
-    if (aicpu_binary == NULL || aicpu_size == 0 || aicore_binary == NULL || aicore_size == 0) return -1;
+int finalize_device(DeviceContextHandle ctx) {
+    if (ctx == NULL) return -1;
+    try {
+        return static_cast<DeviceRunner *>(ctx)->finalize();
+    } catch (...) {
+        return -1;
+    }
+}
 
+int simpler_init(
+    DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
+    const uint8_t *aicore_binary, size_t aicore_size
+) {
+    if (ctx == NULL) return -1;
+
+    DeviceRunner *runner = static_cast<DeviceRunner *>(ctx);
+
+    // CANN dlog must be levelled BEFORE the device context is opened
+    // (rtSetDevice inside attach_current_thread): CANN snapshots the
+    // device-side log session's level at context-open time, so a later
+    // dlog_setlevel is a no-op for the device side. HostLogger is already
+    // seeded here by libsimpler_log.so's simpler_log_init() (runs earlier in
+    // ChipWorker::init). Skipped when ASCEND_GLOBAL_LOG_LEVEL is externally
+    // configured — CANN keeps that.
+    if (std::getenv("ASCEND_GLOBAL_LOG_LEVEL") == NULL) {
+        dlog_setlevel(-1, HostLogger::get_instance().level(), /*enableEvent*/ 0);
+    }
+
+    int rc;
+    try {
+        rc = runner->attach_current_thread(device_id);
+    } catch (...) {
+        return -1;
+    }
+    if (rc != 0) return rc;
+
+    // Transfer ownership of the executor binaries to the runner. Subsequent
+    // prepare_callable / run_prepared invocations reuse them — no per-run
+    // binary push across the C ABI.
+    try {
+        std::vector<uint8_t> aicpu_vec(aicpu_binary, aicpu_binary + aicpu_size);
+        std::vector<uint8_t> aicore_vec(aicore_binary, aicore_binary + aicore_size);
+        runner->set_executors(std::move(aicpu_vec), std::move(aicore_vec));
+    } catch (...) {
+        return -1;
+    }
+    return 0;
+}
+
+/* ===========================================================================
+ * Per-callable_id preparation
+ * =========================================================================== */
+
+int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *callable) {
+    if (ctx == NULL || callable == NULL) return -1;
     DeviceRunner *runner = static_cast<DeviceRunner *>(ctx);
 
     pthread_once(&g_runner_key_once, create_runner_key);
@@ -209,7 +254,68 @@ int run_runtime(
     });
 
     try {
-        int rc = runner->prepare_run_context(device_id);
+        int rc = runner->prepare_run_context(runner->device_id());
+        if (rc != 0) return rc;
+        auto run_context_guard = RAIIScopeGuard([runner]() {
+            runner->release_run_context();
+        });
+
+        PreparedCallableArtifacts artifacts;
+        rc = prepare_callable_impl(
+            reinterpret_cast<const ChipCallable *>(callable), upload_chip_callable_buffer_wrapper, &artifacts
+        );
+        if (rc != 0) {
+            return rc;
+        }
+
+        // Re-pack ChildKernelAddr -> std::pair to match the existing
+        // register_prepared_callable* signature. The named struct only crosses
+        // the runtime-maker / device-runner interface; PreparedCallableState
+        // stores the historical pair shape.
+        std::vector<std::pair<int, uint64_t>> kernel_addrs;
+        kernel_addrs.reserve(artifacts.kernel_addrs.size());
+        for (const ChildKernelAddr &c : artifacts.kernel_addrs) {
+            kernel_addrs.emplace_back(c.func_id, c.device_addr);
+        }
+
+        // hbg's prepare_callable_impl populates host_dlopen_handle; trb's
+        // leaves it null and fills orch_so_data + func_name/config_name.
+        if (artifacts.host_dlopen_handle != nullptr) {
+            return runner->register_prepared_callable_host_orch(
+                callable_id, artifacts.host_dlopen_handle, artifacts.host_orch_func_ptr, std::move(kernel_addrs),
+                std::move(artifacts.signature)
+            );
+        }
+        return runner->register_prepared_callable(
+            callable_id, artifacts.orch_so_data, artifacts.orch_so_size, artifacts.func_name.c_str(),
+            artifacts.config_name.c_str(), std::move(kernel_addrs), std::move(artifacts.signature)
+        );
+    } catch (...) {
+        return -1;
+    }
+}
+
+int run_prepared(
+    DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, int block_dim,
+    int aicpu_thread_num, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, int enable_dep_gen,
+    const char *output_prefix
+) {
+    if (ctx == NULL || runtime == NULL) return -1;
+    DeviceRunner *runner = static_cast<DeviceRunner *>(ctx);
+
+    if (!runner->has_prepared_callable(callable_id)) {
+        LOG_ERROR("run_prepared: callable_id=%d not prepared", callable_id);
+        return -1;
+    }
+
+    pthread_once(&g_runner_key_once, create_runner_key);
+    pthread_setspecific(g_runner_key, ctx);
+    auto tsd_guard = RAIIScopeGuard([]() {
+        pthread_setspecific(g_runner_key, nullptr);
+    });
+
+    try {
+        int rc = runner->prepare_run_context(runner->device_id());
         if (rc != 0) return rc;
         auto run_context_guard = RAIIScopeGuard([runner]() {
             runner->release_run_context();
@@ -220,14 +326,25 @@ int run_runtime(
         r->host_api.device_free = device_free;
         r->host_api.copy_to_device = copy_to_device;
         r->host_api.copy_from_device = copy_from_device;
-        r->host_api.upload_kernel_binary = upload_kernel_binary_wrapper;
-        r->host_api.remove_kernel_binary = remove_kernel_binary_wrapper;
+        r->host_api.upload_chip_callable_buffer = upload_chip_callable_buffer_wrapper;
 
-        LOG_DEBUG("About to call init_runtime_impl, r=%p", (void *)r);
-        rc = init_runtime_impl(
-            r, reinterpret_cast<const ChipCallable *>(callable), reinterpret_cast<const ChipStorageTaskArgs *>(args)
+        // Restore kernel addrs + orch symbol names + active_callable_id; the
+        // returned host_orch_func_ptr is non-null only on the hbg path and is
+        // handed straight into bind_prepared_to_runtime_impl below. signature
+        // is the cached ChipCallable signature_[]; it's plumbed end-to-end for
+        // per-tensor direction decisions in runtime_maker but is currently
+        // unconsumed on both runtimes — see bind_prepared_to_runtime_impl.
+        auto bind_result = runner->bind_prepared_callable_to_runtime(*r, callable_id);
+        if (bind_result.rc != 0) {
+            r->~Runtime();
+            return bind_result.rc;
+        }
+
+        // Per-run binding (tensor args, GM heap, SM alloc)
+        rc = bind_prepared_to_runtime_impl(
+            r, reinterpret_cast<const ChipStorageTaskArgs *>(args), bind_result.host_orch_func_ptr,
+            bind_result.signature, bind_result.sig_count
         );
-        LOG_DEBUG("init_runtime_impl returned: %d", rc);
         if (rc != 0) {
             r->set_gm_sm_ptr(nullptr);
             validate_runtime_impl(r);
@@ -238,11 +355,10 @@ int run_runtime(
         runner->set_l2_swimlane_enabled(enable_l2_swimlane != 0);
         runner->set_dump_tensor_enabled(enable_dump_tensor != 0);
         runner->set_pmu_enabled(enable_pmu);
+        runner->set_dep_gen_enabled(enable_dep_gen != 0);
         runner->set_output_prefix(output_prefix);
 
-        std::vector<uint8_t> aicpu_vec(aicpu_binary, aicpu_binary + aicpu_size);
-        std::vector<uint8_t> aicore_vec(aicore_binary, aicore_binary + aicore_size);
-        rc = runner->run(*r, block_dim, device_id, aicpu_vec, aicore_vec, aicpu_thread_num);
+        rc = runner->run(*r, block_dim, aicpu_thread_num);
         if (rc != 0) {
             validate_runtime_impl(r);
             r->~Runtime();
@@ -257,40 +373,31 @@ int run_runtime(
     }
 }
 
-int finalize_device(DeviceContextHandle ctx) {
+int unregister_callable(DeviceContextHandle ctx, int32_t callable_id) {
     if (ctx == NULL) return -1;
     try {
-        return static_cast<DeviceRunner *>(ctx)->finalize();
+        return static_cast<DeviceRunner *>(ctx)->unregister_prepared_callable(callable_id);
     } catch (...) {
         return -1;
     }
 }
 
-/* ===========================================================================
- * Internal helpers called from runtime_maker.cpp via Runtime.host_api
- * =========================================================================== */
-
-void record_tensor_pair(RuntimeHandle runtime, void *host_ptr, void *dev_ptr, size_t size) {
-    if (runtime == NULL) return;
-    Runtime *r = static_cast<Runtime *>(runtime);
-    r->record_tensor_pair(host_ptr, dev_ptr, size);
+size_t get_aicpu_dlopen_count(DeviceContextHandle ctx) {
+    if (ctx == NULL) return 0;
+    try {
+        return static_cast<DeviceRunner *>(ctx)->aicpu_dlopen_count();
+    } catch (...) {
+        return 0;
+    }
 }
 
-void simpler_init(DeviceContextHandle ctx, int log_level, int log_info_v) {
-    if (ctx == NULL) return;
-
-    // CANN dlog: derive from simpler logger choice unless ASCEND_GLOBAL_LOG_LEVEL
-    // is externally configured.
-    if (std::getenv("ASCEND_GLOBAL_LOG_LEVEL") == NULL) {
-        dlog_setlevel(-1, log_level, /*enableEvent*/ 0);
+size_t get_host_dlopen_count(DeviceContextHandle ctx) {
+    if (ctx == NULL) return 0;
+    try {
+        return static_cast<DeviceRunner *>(ctx)->host_dlopen_count();
+    } catch (...) {
+        return 0;
     }
-
-    HostLogger::get_instance().set_level(static_cast<simpler::log::LogLevel>(log_level));
-    HostLogger::get_instance().set_info_v(log_info_v);
-
-    DeviceRunner *runner = static_cast<DeviceRunner *>(ctx);
-    runner->set_log_level(log_level);
-    runner->set_log_info_v(log_info_v);
 }
 
 }  // extern "C"

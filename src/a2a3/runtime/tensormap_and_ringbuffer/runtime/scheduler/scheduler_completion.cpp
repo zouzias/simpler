@@ -10,7 +10,7 @@
  */
 #include "scheduler_context.h"
 
-#include "aicpu/device_log.h"
+#include "common/unified_log.h"
 #include "aicpu/device_time.h"
 #include "aicpu/platform_regs.h"
 #include "common/l2_perf_profiling.h"
@@ -67,9 +67,9 @@ SlotTransition SchedulerContext::decide_slot_transition(
 
 // Complete one slot's task: subtask counting, mixed completion, deferred release, profiling.
 void SchedulerContext::complete_slot_task(
-    PTO2TaskSlotState &slot_state, int32_t expected_reg_task_id, PTO2SubtaskSlot subslot, int32_t thread_idx,
-    int32_t core_id, Handshake *hank, int32_t &completed_this_turn, PTO2TaskSlotState *deferred_release_slot_states[],
-    int32_t &deferred_release_count, PTO2LocalReadyBuffer *local_bufs
+    PTO2TaskSlotState &slot_state, int32_t expected_reg_task_id, [[maybe_unused]] PTO2SubtaskSlot subslot,
+    int32_t thread_idx, int32_t core_id, Handshake *hank, int32_t &completed_this_turn,
+    PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count, PTO2LocalReadyBuffer *local_bufs
 #if PTO2_PROFILING
     ,
     uint64_t dispatch_ts
@@ -83,18 +83,17 @@ void SchedulerContext::complete_slot_task(
     bool mixed_complete = sched_->on_subtask_complete(slot_state);
     if (slot_state.payload != nullptr) {
         int32_t reg_err = PTO2_ERROR_NONE;
-        PTO2AsyncWaitList::RegisterResult reg_result;
-        volatile PTO2DeferredCompletionIngressBuffer *deferred_ingress =
-            &deferred_ingress_per_core_[core_id][expected_reg_task_id & 1];
-        AsyncCtx async_ctx = AsyncCtx::make(slot_state.task->task_id, deferred_ingress);
+        AsyncWaitList::RegisterResult reg_result;
+        volatile DeferredCompletionSlab *deferred_slab = &deferred_slab_per_core_[core_id][expected_reg_task_id & 1];
+        AsyncCtx async_ctx = AsyncCtx::make(slot_state.task->task_id, deferred_slab);
         do {
             reg_result = sched_->async_wait_list.register_deferred(slot_state, async_ctx, mixed_complete, reg_err);
-            if (reg_result == PTO2AsyncWaitList::RegisterResult::Skipped) {
+            if (reg_result == AsyncWaitList::RegisterResult::Skipped) {
                 SPIN_WAIT_HINT();
             }
-        } while (reg_result == PTO2AsyncWaitList::RegisterResult::Skipped);
+        } while (reg_result == AsyncWaitList::RegisterResult::Skipped);
 
-        if (reg_result == PTO2AsyncWaitList::RegisterResult::Error) {
+        if (reg_result == AsyncWaitList::RegisterResult::Error) {
             int32_t expected = PTO2_ERROR_NONE;
             sched_->sm_header->sched_error_code.compare_exchange_strong(
                 expected, reg_err, std::memory_order_acq_rel, std::memory_order_acquire
@@ -103,7 +102,7 @@ void SchedulerContext::complete_slot_task(
             return;
         }
 
-        if (mixed_complete && reg_result == PTO2AsyncWaitList::RegisterResult::Registered) {
+        if (mixed_complete && reg_result == AsyncWaitList::RegisterResult::Registered) {
             return;
         }
     }
@@ -122,27 +121,25 @@ void SchedulerContext::complete_slot_task(
         }
 #endif
 #if PTO2_SCHED_PROFILING
-        PTO2CompletionStats cstats = sched_->on_mixed_task_complete(slot_state, thread_idx, local_bufs);
-        l2_perf.notify_edges_total += cstats.fanout_edges;
-        if (cstats.fanout_edges > l2_perf.notify_max_degree) l2_perf.notify_max_degree = cstats.fanout_edges;
-        l2_perf.notify_tasks_enqueued += cstats.tasks_enqueued;
-        l2_perf.phase_complete_count++;
+        // SCHED_PROFILING variant takes thread_idx for its per-thread atomic
+        // counter side-effects (g_sched_*_atomic_count[thread_idx], consumed
+        // by the otc_* log lines). Its return value is unused.
+        (void)sched_->on_mixed_task_complete(slot_state, thread_idx, local_bufs);
 #else
         sched_->on_mixed_task_complete(slot_state, local_bufs);
+#endif
 #if PTO2_PROFILING
         l2_perf.phase_complete_count++;
-#endif
 #endif
         if (deferred_release_count < PTO2_DEFERRED_RELEASE_CAP) {
             deferred_release_slot_states[deferred_release_count++] = &slot_state;
         } else {
-            DEV_INFO_V(9, "Thread %d: release", thread_idx);
+            LOG_INFO_V9("Thread %d: release", thread_idx);
             while (deferred_release_count > 0) {
 #if PTO2_SCHED_PROFILING
-                int32_t fe =
-                    sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
-                l2_perf.fanin_edges_total += fe;
-                if (fe > l2_perf.fanin_max_degree) l2_perf.fanin_max_degree = fe;
+                // SCHED_PROFILING variant takes thread_idx for the per-thread
+                // atomic counter side-effects. The return value is unused.
+                (void)sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
 #else
                 sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
 #endif
@@ -157,9 +154,7 @@ void SchedulerContext::complete_slot_task(
 #if PTO2_SCHED_PROFILING
         uint64_t t_perf_start = get_sys_cnt_aicpu();
 #endif
-        Handshake *h = &hank[core_id];
         uint64_t finish_ts = get_sys_cnt_aicpu();
-        L2PerfBuffer *pbuf = reinterpret_cast<L2PerfBuffer *>(h->l2_perf_records_addr);
 
         uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
         int32_t fanout_n = 0;
@@ -171,11 +166,11 @@ void SchedulerContext::complete_slot_task(
 
         int32_t perf_slot_idx = static_cast<int32_t>(subslot);
         if (l2_perf_aicpu_complete_record(
-                pbuf, static_cast<uint32_t>(expected_reg_task_id), slot_state.task->task_id.raw,
+                core_id, thread_idx, static_cast<uint32_t>(expected_reg_task_id), slot_state.task->task_id.raw,
                 slot_state.task->kernel_id[perf_slot_idx], hank[core_id].core_type, dispatch_ts, finish_ts, fanout_arr,
                 fanout_n
             ) != 0) {
-            DEV_ERROR(
+            LOG_ERROR(
                 "Core %d: l2_perf_aicpu_complete_record failed for task 0x%" PRIx64, core_id,
                 static_cast<uint64_t>(slot_state.task->task_id.raw)
             );
@@ -184,9 +179,7 @@ void SchedulerContext::complete_slot_task(
         l2_perf.sched_complete_perf_cycle += (get_sys_cnt_aicpu() - t_perf_start);
 #endif
     }
-#endif
 
-#if PTO2_PROFILING
     if (is_pmu_enabled()) {
         pmu_aicpu_record_task(
             core_id, thread_idx, slot_state.task->task_id.raw,
@@ -351,7 +344,7 @@ int32_t SchedulerContext::count_global_available(PTO2ResourceShape shape) {
 // Drain worker: dispatch all blocks in one pass across all threads' trackers.
 // Called only when global resources >= block_num, so one pass always suffices.
 // All other threads are spinning -- the drain worker has exclusive tracker access.
-void SchedulerContext::drain_worker_dispatch(Runtime *runtime, int32_t block_num) {
+void SchedulerContext::drain_worker_dispatch(int32_t block_num) {
     PTO2TaskSlotState *slot_state = drain_state_.pending_task;
     if (!slot_state) {
         drain_state_.sync_start_pending.store(0, std::memory_order_release);
@@ -362,7 +355,7 @@ void SchedulerContext::drain_worker_dispatch(Runtime *runtime, int32_t block_num
     for (int32_t t = 0; t < active_sched_threads_ && slot_state->next_block_idx < block_num; t++) {
         auto valid = core_trackers_[t].get_idle_core_offset_states(shape);
         while (valid.has_value() && slot_state->next_block_idx < block_num) {
-            dispatch_block(runtime, t, valid.pop_first(), *slot_state, shape, false);
+            dispatch_block(t, valid.pop_first(), *slot_state, shape, false);
             slot_state->next_block_idx++;
         }
     }
@@ -389,7 +382,7 @@ void SchedulerContext::drain_worker_dispatch(Runtime *runtime, int32_t block_num
 //   3. Dispatch: elected thread dispatches all blocks (one pass, resources guaranteed).
 //      Non-elected threads spin-wait until sync_start_pending == 0.
 //      During dispatch the elected thread has exclusive tracker access.
-void SchedulerContext::handle_drain_mode(Runtime *runtime, int32_t thread_idx) {
+void SchedulerContext::handle_drain_mode(int32_t thread_idx) {
     // Spin until drain is fully initialized (sentinel -1 -> block_num > 0).
     int32_t block_num;
     do {
@@ -440,5 +433,5 @@ void SchedulerContext::handle_drain_mode(Runtime *runtime, int32_t thread_idx) {
     }
 
     // Dispatch -- all other threads are spinning, elected thread has exclusive tracker access.
-    drain_worker_dispatch(runtime, block_num);
+    drain_worker_dispatch(block_num);
 }

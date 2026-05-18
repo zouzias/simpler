@@ -159,20 +159,24 @@ from simpler_setup.runtime_builder import RuntimeBuilder
 builder = RuntimeBuilder(platform="a2a3sim")
 binaries = builder.get_binaries("tensormap_and_ringbuffer")
 
-# Create worker and initialize with platform binaries
+# Create worker and initialize with platform binaries (attaches the calling
+# thread to device 0 internally — no separate set_device step required)
 worker = ChipWorker()
-worker.init(host_path=str(binaries.host_path),
-            aicpu_path=str(binaries.aicpu_path),
-            aicore_path=str(binaries.aicore_path))
-worker.set_device(device_id=0)
+worker.init(device_id=0, bins=binaries)
 
-# Execute callable on device
-worker.run(chip_callable, orch_args, block_dim=24)
+# Register the ChipCallable to obtain a callable_id
+cid = worker.register(chip_callable)
+
+# Execute the registered callable on device
+worker.run(cid, orch_args, block_dim=24)
 
 # Cleanup
-worker.reset_device()
 worker.finalize()
 ```
+
+`ChipWorker` follows the same `register → run(cid)` contract as
+`Worker(level=2)`; reach for the high-level `Worker` first and use
+`ChipWorker` only when a low-level handle is required.
 
 ## Configuration
 
@@ -216,9 +220,14 @@ python examples/a2a3/host_build_graph/vector_example/test_vector_example.py -p a
 
 Device logs written to `~/ascend/log/debug/device-<id>/`
 
-Kernel uses macros:
+Both host and AICPU kernel code use the unified `LOG_*` macros from
+`common/unified_log.h`:
 
-- `DEV_INFO`: Informational messages
-- `DEV_DEBUG`: Debug messages
-- `DEV_WARN`: Warnings
-- `DEV_ERROR`: Error messages
+- `LOG_INFO_V0` .. `LOG_INFO_V9`: INFO with verbosity tier (V0 most verbose,
+  V9 most must-see, V5 default)
+- `LOG_DEBUG`: Debug messages
+- `LOG_WARN`: Warnings
+- `LOG_ERROR`: Error messages
+
+Threshold is configured from Python via the `simpler` logger:
+`logging.getLogger("simpler").setLevel(simpler.V3)`.

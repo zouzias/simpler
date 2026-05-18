@@ -9,276 +9,456 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+/**
+ * @file pmu_collector.cpp
+ * @brief Host-side PMU collector. The mgmt-thread + buffer-pool machinery
+ *        lives in profiling_common::BufferPoolManager parameterized by
+ *        PmuModule (host/pmu_collector.h); this file owns the per-buffer
+ *        on_buffer_collected callback (CSV output) and the device-side
+ *        cross-check. The poll loop itself lives in
+ *        profiling_common::ProfilerBase.
+ *
+ * a5 specifics: device↔host transfers go through profiling_copy.h. Each
+ * PmuBuffer's contents are pulled from device on demand inside
+ * ProfilerAlgorithms::process_entry, so on_buffer_collected can read
+ * `count` and `records[]` directly off the host shadow.
+ */
+
 #include "host/pmu_collector.h"
 
+#include <cassert>
+#include <cstdlib>
 #include <cstring>
-#include <fstream>
+#include <iomanip>
+#include <ios>
 
-PmuCollector::~PmuCollector() {
-    if (setup_header_dev_ != nullptr) {
-        // Not called finalize() — best-effort free to avoid leaking device memory
-        // on abnormal exits. Errors swallowed because we are already unwinding.
-        (void)finalize();
+#include "common/memory_barrier.h"
+#include "common/unified_log.h"
+#include "host/profiling_copy.h"
+
+PmuCollector::~PmuCollector() { stop(); }
+
+void *PmuCollector::alloc_single_buffer(size_t size, void **host_ptr_out) {
+    void *dev_ptr = alloc_cb_(size, user_data_);
+    if (dev_ptr == nullptr) {
+        if (host_ptr_out) *host_ptr_out = nullptr;
+        return nullptr;
     }
+
+    void *host_ptr = nullptr;
+    if (register_cb_ != nullptr) {
+        int rc = register_cb_(dev_ptr, size, device_id_, &host_ptr);
+        if (rc != 0 || host_ptr == nullptr) {
+            LOG_ERROR("PmuCollector: register failed: %d", rc);
+            free_cb_(dev_ptr, user_data_);
+            if (host_ptr_out) *host_ptr_out = nullptr;
+            return nullptr;
+        }
+    } else {
+        host_ptr = std::malloc(size);
+        if (host_ptr == nullptr) {
+            LOG_ERROR("PmuCollector: host shadow alloc failed for %zu bytes", size);
+            free_cb_(dev_ptr, user_data_);
+            if (host_ptr_out) *host_ptr_out = nullptr;
+            return nullptr;
+        }
+        std::memset(host_ptr, 0, size);
+        profiling_copy_to_device(dev_ptr, host_ptr, size);
+    }
+
+    if (host_ptr_out) *host_ptr_out = host_ptr;
+    manager_.register_mapping(dev_ptr, host_ptr);
+    return dev_ptr;
 }
 
-int PmuCollector::initialize(
-    int num_cores, PmuEventType event_type, uint64_t *kernel_args_pmu_data_base, PmuAllocCallback alloc_cb,
-    PmuFreeCallback free_cb, PmuCopyToDeviceCallback copy_to_dev_cb, PmuCopyFromDeviceCallback copy_from_dev_cb
+// ---------------------------------------------------------------------------
+// init
+// ---------------------------------------------------------------------------
+
+int PmuCollector::init(
+    int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, PmuAllocCallback alloc_cb,
+    PmuRegisterCallback register_cb, PmuFreeCallback free_cb, void *user_data, int device_id
 ) {
-    if (num_cores <= 0 || num_cores > PLATFORM_MAX_CORES || kernel_args_pmu_data_base == nullptr ||
-        alloc_cb == nullptr || free_cb == nullptr || copy_to_dev_cb == nullptr || copy_from_dev_cb == nullptr) {
-        LOG_ERROR("PmuCollector::initialize invalid arguments (num_cores=%d)", num_cores);
+    if (num_cores <= 0 || num_threads <= 0 || alloc_cb == nullptr || free_cb == nullptr) {
+        LOG_ERROR("PmuCollector::init: invalid arguments");
+        return -1;
+    }
+    if (initialized_) {
+        LOG_ERROR("PmuCollector already initialized");
         return -1;
     }
 
     num_cores_ = num_cores;
+    num_threads_ = num_threads;
     event_type_ = event_type;
-    alloc_cb_ = alloc_cb;
-    free_cb_ = free_cb;
-    copy_to_dev_cb_ = copy_to_dev_cb;
-    copy_from_dev_cb_ = copy_from_dev_cb;
-    pmu_buffer_bytes_ = sizeof(PmuBuffer);
-    setup_region_bytes_ = calc_pmu_setup_size(num_cores_);
+    csv_path_ = csv_path;
 
-    // Allocate the [PmuSetupHeader][PmuBufferState[num_cores]] shared region
-    // on device in a single allocation.
-    setup_header_dev_ = alloc_cb_(setup_region_bytes_);
-    if (setup_header_dev_ == nullptr) {
-        LOG_ERROR("PmuCollector::initialize: failed to alloc PMU setup region (%zu bytes)", setup_region_bytes_);
+    total_collected_ = 0;
+    if (csv_file_.is_open()) {
+        csv_file_.close();
+    }
+
+    // Stash callbacks on the base up-front so alloc_single_buffer sees
+    // consistent values during init. shm_host_ stays nullptr until the shm
+    // allocation succeeds — start(tf) gates on shm_host_.
+    set_memory_context(
+        alloc_cb, register_cb, free_cb, user_data, /*shm_dev=*/nullptr, /*shm_host=*/nullptr, /*shm_size=*/0, device_id
+    );
+
+    // ---- Allocate shared header + buffer-state region ----
+    size_t shm_size = calc_pmu_data_size(num_cores);
+    void *shm_host_local = nullptr;
+    void *shm_dev_local = alloc_single_buffer(shm_size, &shm_host_local);
+    if (shm_dev_local == nullptr) {
+        LOG_ERROR("PmuCollector: failed to allocate PMU shared memory (%zu bytes)", shm_size);
         return -1;
     }
 
-    // Allocate one PmuBuffer per core and remember the device pointers.
-    core_buffers_dev_.assign(num_cores_, nullptr);
-    std::vector<uint8_t> host_setup(setup_region_bytes_, 0);
-    PmuSetupHeader *host_header = get_pmu_setup_header(host_setup.data());
-    host_header->num_cores = static_cast<uint32_t>(num_cores_);
-    host_header->event_type = static_cast<uint32_t>(event_type_);
-    for (int i = 0; i < num_cores_; ++i) {
-        void *buf_dev = alloc_cb_(pmu_buffer_bytes_);
-        if (buf_dev == nullptr) {
-            LOG_ERROR("PmuCollector::initialize: failed to alloc PmuBuffer for core %d", i);
-            finalize();
+    std::memset(shm_host_local, 0, shm_size);
+    PmuDataHeader *hdr = get_pmu_header(shm_host_local);
+    hdr->event_type = static_cast<uint32_t>(event_type);
+    hdr->num_cores = static_cast<uint32_t>(num_cores);
+
+    // ---- Allocate the per-core ring-address table for AICore. The ring
+    // table is filled fully by the host. AICore resolves its own PMU MMIO
+    // base at kernel entry from `KernelArgs::regs[get_physical_core_id()]`,
+    // so no separate PMU reg-address table is needed.
+    aicore_rings_dev_.assign(num_cores, nullptr);
+    size_t table_size = static_cast<size_t>(num_cores) * sizeof(uint64_t);
+    aicore_ring_addrs_dev_ = alloc_single_buffer(table_size, &aicore_ring_addrs_host_);
+    if (aicore_ring_addrs_dev_ == nullptr) {
+        LOG_ERROR("PmuCollector: failed to allocate aicore ring address table (%zu bytes)", table_size);
+        return -1;
+    }
+    std::memset(aicore_ring_addrs_host_, 0, table_size);
+
+    // ---- Allocate per-core PmuBuffers; populate free_queues + recycled pool ----
+    const size_t buf_size = sizeof(PmuBuffer);
+
+    for (int c = 0; c < num_cores; c++) {
+        PmuBufferState *state = get_pmu_buffer_state(shm_host_local, c);
+
+        // Allocate the per-core stable PmuAicoreRing (no host shadow needed).
+        void *ring_dev = alloc_cb(sizeof(PmuAicoreRing), user_data);
+        if (ring_dev == nullptr) {
+            LOG_ERROR("PmuCollector: failed to allocate PmuAicoreRing for core %d", c);
             return -1;
         }
-        core_buffers_dev_[i] = buf_dev;
-        host_header->buffer_ptrs[i] = reinterpret_cast<uint64_t>(buf_dev);
+        aicore_rings_dev_[c] = ring_dev;
+        state->aicore_ring_ptr = reinterpret_cast<uint64_t>(ring_dev);
+        reinterpret_cast<uint64_t *>(aicore_ring_addrs_host_)[c] = reinterpret_cast<uint64_t>(ring_dev);
 
-        // Zero the buffer header on device so count starts at 0. Per-core
-        // dropped/total counters live in PmuBufferState (zero-init below).
-        PmuBuffer zero_hdr{};
-        int rc = copy_to_dev_cb_(buf_dev, &zero_hdr, PMU_BUFFER_HEADER_BYTES);
-        if (rc != 0) {
-            LOG_ERROR("PmuCollector::initialize: failed to zero PmuBuffer header for core %d (rc=%d)", i, rc);
-            finalize();
-            return rc;
+        for (int b = 0; b < PLATFORM_PMU_BUFFERS_PER_CORE; b++) {
+            void *host_ptr = nullptr;
+            void *dev_ptr = alloc_single_buffer(buf_size, &host_ptr);
+            if (dev_ptr == nullptr) {
+                LOG_ERROR("PmuCollector: failed to allocate PmuBuffer c=%d b=%d", c, b);
+                return -1;
+            }
+
+            if (b < PLATFORM_PMU_SLOT_COUNT) {
+                uint32_t tail = state->free_queue.tail;
+                assert(tail - state->free_queue.head < PLATFORM_PMU_SLOT_COUNT && "free_queue overflow on init");
+                state->free_queue.buffer_ptrs[tail % PLATFORM_PMU_SLOT_COUNT] = reinterpret_cast<uint64_t>(dev_ptr);
+                state->free_queue.tail = tail + 1;
+            } else {
+                manager_.push_recycled(0, dev_ptr);
+            }
         }
     }
 
-    // Publish the setup region (header + zero-initialized PmuBufferState[]) to device.
-    int rc = copy_to_dev_cb_(setup_header_dev_, host_setup.data(), setup_region_bytes_);
-    if (rc != 0) {
-        LOG_ERROR("PmuCollector::initialize: failed to publish PMU setup region (rc=%d)", rc);
-        finalize();
-        return rc;
+    // Push the populated ring address table to device.
+    profiling_copy_to_device(aicore_ring_addrs_dev_, aicore_ring_addrs_host_, table_size);
+
+    // Push the entire initialized shm region (header + BufferStates +
+    // free_queue contents) to device.
+    profiling_copy_to_device(shm_dev_local, shm_host_local, shm_size);
+
+    // ---- Build CSV header string (file is opened lazily on first record) ----
+    {
+        std::string header = "thread_id,core_id,task_id,func_id,core_type,pmu_total_cycles";
+        const PmuEventConfig *evt = pmu_resolve_event_config_a5(event_type);
+        if (evt == nullptr) {
+            evt = &PMU_EVENTS_A5_PIPE_UTIL;
+        }
+        for (int i = 0; i < PMU_COUNTER_COUNT_A5; i++) {
+            const char *name = evt->counter_names[i];
+            if (name == nullptr || name[0] == '\0') {
+                continue;
+            }
+            header += ',';
+            header += name;
+        }
+        header += ",event_type\n";
+        csv_header_ = std::move(header);
     }
 
-    *kernel_args_pmu_data_base = reinterpret_cast<uint64_t>(setup_header_dev_);
+    initialized_ = true;
+    shm_dev_ = shm_dev_local;
+
+    // Re-set_memory_context now that the shm region is ready. start(tf)
+    // gates on shm_host_ being non-null, so this is the moment the
+    // collector becomes startable.
+    set_memory_context(alloc_cb, register_cb, free_cb, user_data, shm_dev_local, shm_host_local, shm_size, device_id);
+
     LOG_INFO_V0(
-        "PMU collector initialized: %d cores, event_type=%u, setup_header=0x%lx", num_cores_,
-        static_cast<uint32_t>(event_type_), static_cast<unsigned long>(*kernel_args_pmu_data_base)
+        "PMU collector initialized: %d cores, %d threads, SHM=0x%lx, CSV=%s (opened on first record)", num_cores,
+        num_threads, reinterpret_cast<unsigned long>(shm_dev_), csv_path_.c_str()
     );
     return 0;
 }
 
-int PmuCollector::collect_all() {
-    if (setup_header_dev_ == nullptr) {
-        LOG_ERROR("PmuCollector::collect_all: not initialized");
-        return -1;
-    }
-    collected_records_.assign(num_cores_, {});
-    dropped_counts_.assign(num_cores_, 0);
-    total_counts_.assign(num_cores_, 0);
-    owning_thread_ids_.assign(num_cores_, 0);
+// ---------------------------------------------------------------------------
+// CSV writing
+// ---------------------------------------------------------------------------
 
-    // Pull the full setup region back to read all PmuBufferState[] in one shot.
-    std::vector<uint8_t> host_setup(setup_region_bytes_, 0);
-    int rc = copy_from_dev_cb_(host_setup.data(), setup_header_dev_, setup_region_bytes_);
-    if (rc != 0) {
-        LOG_ERROR("PmuCollector::collect_all: setup region copy failed (rc=%d)", rc);
-        return rc;
+void PmuCollector::ensure_csv_open_unlocked() {
+    if (csv_file_.is_open()) return;
+    csv_file_.open(csv_path_, std::ios::out | std::ios::trunc);
+    if (!csv_file_.is_open()) {
+        LOG_ERROR("PmuCollector: failed to open CSV file: %s", csv_path_.c_str());
+        return;
     }
-    for (int i = 0; i < num_cores_; ++i) {
-        PmuBufferState *state = get_pmu_buffer_state(host_setup.data(), i);
-        dropped_counts_[i] = state->dropped_record_count;
-        total_counts_[i] = state->total_record_count;
-        owning_thread_ids_[i] = state->owning_thread_id;
+    csv_file_ << csv_header_;
+}
+
+void PmuCollector::write_buffer_to_csv(int core_id, int thread_idx, const void *buf_host_ptr) {
+    const PmuBuffer *buf = reinterpret_cast<const PmuBuffer *>(buf_host_ptr);
+    uint32_t n = buf->count;
+    if (n > static_cast<uint32_t>(PLATFORM_PMU_RECORDS_PER_BUFFER)) {
+        n = static_cast<uint32_t>(PLATFORM_PMU_RECORDS_PER_BUFFER);
+    }
+    if (n == 0) return;
+
+    std::lock_guard<std::mutex> lock(csv_mutex_);
+    ensure_csv_open_unlocked();
+    if (!csv_file_.is_open()) return;
+    total_collected_ += n;
+
+    const PmuEventConfig *evt = pmu_resolve_event_config_a5(event_type_);
+    if (evt == nullptr) {
+        evt = &PMU_EVENTS_A5_PIPE_UTIL;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        const PmuRecord &r = buf->records[i];
+        csv_file_ << thread_idx << ',' << core_id << ',';
+        csv_file_ << "0x" << std::hex << std::setw(16) << std::setfill('0') << r.task_id << std::dec
+                  << std::setfill(' ');
+        csv_file_ << ',' << r.func_id << ',' << static_cast<int>(r.core_type) << ',' << r.pmu_total_cycles;
+        for (int k = 0; k < PMU_COUNTER_COUNT_A5; k++) {
+            const char *name = evt->counter_names[k];
+            if (name == nullptr || name[0] == '\0') {
+                continue;
+            }
+            csv_file_ << ',' << r.pmu_counters[k];
+        }
+        csv_file_ << ',' << static_cast<uint32_t>(event_type_) << '\n';
+    }
+    csv_file_.flush();
+}
+
+// ---------------------------------------------------------------------------
+// ProfilerBase callback
+// ---------------------------------------------------------------------------
+
+void PmuCollector::on_buffer_collected(const PmuReadyBufferInfo &info) {
+    write_buffer_to_csv(static_cast<int>(info.core_index), static_cast<int>(info.thread_index), info.host_buffer_ptr);
+}
+
+// ---------------------------------------------------------------------------
+// reconcile_counters: passive sanity-check + device-side cross-check
+// ---------------------------------------------------------------------------
+//
+// Host never recovers records from device-side current_buf_ptr. Device
+// flush (pmu_aicpu_flush_buffers) is the only data path: a flush failure
+// must bump dropped_record_count and clear current_buf_ptr on the device
+// side. Host's job here is purely accounting + sanity assertion —
+// recovering would mask AICPU flush bugs.
+
+void PmuCollector::reconcile_counters() {
+    if (shm_host_ == nullptr) return;
+
+    // Pull the latest BufferStates (current_buf_ptr, total/dropped/mismatch
+    // counters) before the per-core sanity loop so the cross-check sees
+    // post-stop() device state.
+    if (manager_.shared_mem_dev() != nullptr && shm_size_ > 0) {
+        profiling_copy_from_device(shm_host_, manager_.shared_mem_dev(), shm_size_);
+    }
+    rmb();
+
+    // After stop(), pmu_aicpu_flush_buffers should have either enqueued the
+    // active buffer (success → current_buf_ptr=0) or counted it as dropped
+    // and cleared it. A non-zero pointer with non-zero count means records
+    // AICPU neither delivered nor accounted for — a device-side flush bug.
+    int leftover_active = 0;
+    for (int c = 0; c < num_cores_; c++) {
+        PmuBufferState *state = pmu_state(c);
+        uint64_t buf_dev = state->current_buf_ptr;
+        if (buf_dev == 0) continue;
+
+        void *host_ptr = manager_.resolve_host_ptr(reinterpret_cast<void *>(buf_dev));
+        if (host_ptr == nullptr) continue;
+
+        profiling_copy_from_device(host_ptr, reinterpret_cast<void *>(buf_dev), sizeof(PmuBuffer));
+        uint32_t count = reinterpret_cast<const PmuBuffer *>(host_ptr)->count;
+        if (count == 0) continue;
+
+        LOG_ERROR(
+            "PMU reconcile: core %d has un-flushed buffer (current_buf_ptr=0x%lx, count=%u) after "
+            "stop() — device flush failed",
+            c, static_cast<unsigned long>(buf_dev), count
+        );
+        leftover_active++;
     }
 
-    PmuBuffer header_buf{};
-    for (int i = 0; i < num_cores_; ++i) {
-        void *buf_dev = core_buffers_dev_[i];
-        if (buf_dev == nullptr) {
-            continue;
+    if (leftover_active > 0) {
+        LOG_ERROR("PMU reconcile: %d core(s) had un-cleared current_buf_ptr — see prior errors", leftover_active);
+    }
+
+    // Cross-check device-side totals against host CSV.  PMU is single-kind
+    // (one per-core pool), so reconcile_one is invoked once; the lambda
+    // shape matches L2PerfCollector::reconcile_counters so the two
+    // single-arch implementations stay diff-able.
+    auto reconcile_one = [&](int unit_count, auto get_state, uint64_t collected, bool optional) {
+        uint64_t total_device = 0;
+        uint64_t dropped_device = 0;
+        uint64_t mismatch_device = 0;
+        for (int i = 0; i < unit_count; i++) {
+            PmuBufferState *state = get_state(i);
+            total_device += state->total_record_count;
+            dropped_device += state->dropped_record_count;
+            mismatch_device += state->mismatch_record_count;
         }
-        // Copy the 64-byte header to learn record count.
-        rc = copy_from_dev_cb_(&header_buf, buf_dev, PMU_BUFFER_HEADER_BYTES);
-        if (rc != 0) {
-            LOG_ERROR("PmuCollector::collect_all: header copy failed for core %d (rc=%d)", i, rc);
-            return rc;
+
+        if (optional && total_device == 0 && collected == 0 && dropped_device == 0 && mismatch_device == 0) {
+            return;
         }
-        uint32_t count = header_buf.count;
-        if (count > static_cast<uint32_t>(PLATFORM_PMU_RECORDS_PER_BUFFER)) {
+
+        if (dropped_device > 0) {
             LOG_WARN(
-                "PmuCollector::collect_all: core %d count=%u clamped to capacity %d", i, count,
-                PLATFORM_PMU_RECORDS_PER_BUFFER
+                "PMU reconcile: %lu records dropped on device side (free_queue empty or ready_queue full). "
+                "Increase PLATFORM_PMU_BUFFERS_PER_CORE / PLATFORM_PMU_READYQUEUE_SIZE if this is frequent.",
+                static_cast<unsigned long>(dropped_device)
             );
-            count = PLATFORM_PMU_RECORDS_PER_BUFFER;
         }
-        if (count == 0) {
-            continue;
+        if (mismatch_device > 0) {
+            LOG_ERROR(
+                "PMU reconcile: %lu records lost to AICore staging-slot task_id mismatch — "
+                "completion-before-dispatch invariant violated",
+                static_cast<unsigned long>(mismatch_device)
+            );
         }
+        uint64_t accounted = collected + dropped_device + mismatch_device;
+        if (accounted != total_device) {
+            LOG_WARN(
+                "PMU reconcile: record count mismatch (collected=%lu + dropped=%lu + mismatch=%lu != "
+                "device_total=%lu, silent_loss=%ld) — AICore/AICPU race",
+                static_cast<unsigned long>(collected), static_cast<unsigned long>(dropped_device),
+                static_cast<unsigned long>(mismatch_device), static_cast<unsigned long>(total_device),
+                static_cast<long>(total_device) - static_cast<long>(accounted)
+            );
+        } else {
+            LOG_INFO_V0(
+                "PMU reconcile: record counts match (collected=%lu, dropped=%lu, mismatch=%lu, device_total=%lu)",
+                static_cast<unsigned long>(collected), static_cast<unsigned long>(dropped_device),
+                static_cast<unsigned long>(mismatch_device), static_cast<unsigned long>(total_device)
+            );
+        }
+    };
 
-        // Copy just the used portion of the records array.
-        collected_records_[i].resize(count);
-        const uint8_t *records_dev = reinterpret_cast<const uint8_t *>(buf_dev) + offsetof(PmuBuffer, records);
-        rc = copy_from_dev_cb_(
-            collected_records_[i].data(), const_cast<uint8_t *>(records_dev),
-            static_cast<size_t>(count) * sizeof(PmuRecord)
-        );
-        if (rc != 0) {
-            LOG_ERROR("PmuCollector::collect_all: records copy failed for core %d (rc=%d)", i, rc);
-            return rc;
-        }
-    }
-    return 0;
+    reconcile_one(
+        num_cores_,
+        [this](int c) {
+            return pmu_state(c);
+        },
+        total_collected_, /*optional=*/false
+    );
 }
 
-int PmuCollector::export_csv(const std::string &output_dir) {
-    if (setup_header_dev_ == nullptr) {
-        return -1;
+// ---------------------------------------------------------------------------
+// finalize
+// ---------------------------------------------------------------------------
+
+void PmuCollector::finalize(PmuUnregisterCallback unregister_cb, PmuFreeCallback free_cb, void *user_data) {
+    if (!initialized_) return;
+
+    // Stop mgmt + collector threads if the caller didn't already (idempotent).
+    stop();
+
+    if (csv_file_.is_open()) {
+        csv_file_.close();
     }
 
-    const PmuEventConfig *cfg = pmu_resolve_event_config_a5(event_type_);
-    if (cfg == nullptr) {
-        cfg = &PMU_EVENTS_A5_PIPE_UTIL;
-    }
-
-    std::string csv_path = make_pmu_csv_path(output_dir);
-    std::ofstream csv(csv_path);
-    if (!csv.is_open()) {
-        LOG_ERROR("PmuCollector::export_csv: failed to open %s", csv_path.c_str());
-        return -1;
-    }
-
-    // Count named columns. Matches pypto's tilefwk_pmu_to_csv.py
-    // table_pmu_header_3510 — each event group lists only the columns that
-    // correspond to a named counter. pypto then trims each row to
-    // len(fixed_header) + len(named) via _trim_task_pmu_list; we do the
-    // equivalent positional trim here (first `named_count` counter values,
-    // pmu_counters[0..named_count-1]).
-    int named_count = 0;
-    for (int i = 0; i < PMU_COUNTER_COUNT_A5; ++i) {
-        if (cfg->counter_names[i] != nullptr && cfg->counter_names[i][0] != '\0') {
-            ++named_count;
+    auto release_dev = [&](void *p) {
+        if (p == nullptr) return;
+        if (unregister_cb != nullptr) {
+            unregister_cb(p, device_id_);
         }
-    }
-
-    // Header: fixed columns + named counter names + event_type column.
-    // Column order matches a2a3 host pmu_collector for downstream tooling parity.
-    csv << "thread_id,core_id,task_id,func_id,core_type,pmu_total_cycles";
-    int emitted = 0;
-    for (int i = 0; i < PMU_COUNTER_COUNT_A5 && emitted < named_count; ++i) {
-        if (cfg->counter_names[i] != nullptr && cfg->counter_names[i][0] != '\0') {
-            csv << "," << cfg->counter_names[i];
-            ++emitted;
+        if (free_cb != nullptr) {
+            free_cb(p, user_data);
         }
-    }
-    csv << ",event_type\n";
+    };
 
-    uint64_t total_rows = 0;
-    uint64_t total_dropped = 0;
-    uint64_t device_total = 0;
-    for (int core_id = 0; core_id < num_cores_; ++core_id) {
-        const auto &records = collected_records_[core_id];
-        uint32_t thread_id = owning_thread_ids_[core_id];
-        for (const auto &rec : records) {
-            csv << thread_id << "," << core_id << ",0x" << std::hex << rec.task_id << std::dec << "," << rec.func_id
-                << "," << static_cast<int>(rec.core_type) << "," << rec.pmu_total_cycles;
-            for (int i = 0; i < named_count; ++i) {
-                csv << "," << rec.pmu_counters[i];
+    // Free buffers still parked in per-core free_queues / current_buf_ptr.
+    // Release the device pointer only — the paired host shadow stays in
+    // dev_to_host_ and is freed by clear_mappings() below (single source of
+    // truth for shadow lifetime, no double-free).
+    if (shm_host_ != nullptr) {
+        for (int c = 0; c < num_cores_; c++) {
+            PmuBufferState *state = pmu_state(c);
+
+            release_dev(reinterpret_cast<void *>(state->current_buf_ptr));
+            state->current_buf_ptr = 0;
+
+            rmb();
+            uint32_t head = state->free_queue.head;
+            uint32_t tail = state->free_queue.tail;
+            uint32_t queued = tail - head;
+            if (queued > PLATFORM_PMU_SLOT_COUNT) queued = PLATFORM_PMU_SLOT_COUNT;
+            for (uint32_t i = 0; i < queued; i++) {
+                uint32_t slot = (head + i) % PLATFORM_PMU_SLOT_COUNT;
+                release_dev(reinterpret_cast<void *>(state->free_queue.buffer_ptrs[slot]));
+                state->free_queue.buffer_ptrs[slot] = 0;
             }
-            csv << "," << static_cast<uint32_t>(event_type_) << "\n";
-            ++total_rows;
-        }
-        total_dropped += dropped_counts_[core_id];
-        device_total += total_counts_[core_id];
-    }
-    csv.flush();
-    LOG_INFO_V0("PMU CSV written to %s", csv_path.c_str());
-
-    // Cross-check device-side totals against what we wrote to CSV. Invariant:
-    //   device_total == collected + dropped (buffer-full) + slot-mismatch
-    // collected + dropped should account for every commit attempt; any
-    // remainder is silent slot-mismatch loss (AICore not yet published).
-    if (total_dropped > 0) {
-        LOG_WARN(
-            "PMU collector: %lu records dropped on device side (PmuBuffer full). "
-            "Increase PLATFORM_PMU_RECORDS_PER_BUFFER if this is frequent.",
-            static_cast<unsigned long>(total_dropped)
-        );
-    }
-    if (total_rows + total_dropped != device_total) {
-        LOG_WARN(
-            "PMU collector: record count mismatch (collected=%lu + dropped=%lu != device_total=%lu, "
-            "diff=%ld silent slot-mismatch losses)",
-            static_cast<unsigned long>(total_rows), static_cast<unsigned long>(total_dropped),
-            static_cast<unsigned long>(device_total),
-            static_cast<long>(device_total) - static_cast<long>(total_rows + total_dropped)
-        );
-    } else {
-        LOG_INFO_V0(
-            "PMU collector: record counts match (collected=%lu, dropped=%lu, device_total=%lu)",
-            static_cast<unsigned long>(total_rows), static_cast<unsigned long>(total_dropped),
-            static_cast<unsigned long>(device_total)
-        );
-    }
-    return 0;
-}
-
-int PmuCollector::finalize() {
-    int rc = 0;
-    for (void *&buf : core_buffers_dev_) {
-        if (buf != nullptr) {
-            int r = free_cb_ ? free_cb_(buf) : 0;
-            if (r != 0 && rc == 0) {
-                rc = r;
-            }
-            buf = nullptr;
+            state->free_queue.head = tail;
         }
     }
-    core_buffers_dev_.clear();
 
-    if (setup_header_dev_ != nullptr && free_cb_ != nullptr) {
-        int r = free_cb_(setup_header_dev_);
-        if (r != 0 && rc == 0) {
-            rc = r;
+    // Release framework-owned buffers (recycled pool, ready_queue,
+    // done_queue). release_owned_buffers also frees their host shadows.
+    manager_.release_owned_buffers([&](void *p) {
+        release_dev(p);
+    });
+
+    // Free per-core PmuAicoreRings (no host shadow paired). The rings were
+    // allocated directly via alloc_cb (not alloc_single_buffer), so no entry
+    // exists in dev_to_host_ for them.
+    for (auto *ring_dev : aicore_rings_dev_) {
+        if (ring_dev != nullptr) {
+            release_dev(ring_dev);
         }
     }
-    setup_header_dev_ = nullptr;
+    aicore_rings_dev_.clear();
 
-    num_cores_ = 0;
-    event_type_ = PmuEventType::PIPE_UTILIZATION;
-    pmu_buffer_bytes_ = 0;
-    setup_region_bytes_ = 0;
-    collected_records_.clear();
-    dropped_counts_.clear();
-    total_counts_.clear();
-    owning_thread_ids_.clear();
-    alloc_cb_ = nullptr;
-    free_cb_ = nullptr;
-    copy_to_dev_cb_ = nullptr;
-    copy_from_dev_cb_ = nullptr;
-    return rc;
+    // Free the per-core ring-address table (device side; host shadow lives
+    // in dev_to_host_ and is freed by clear_mappings below).
+    if (aicore_ring_addrs_dev_ != nullptr) {
+        release_dev(aicore_ring_addrs_dev_);
+        aicore_ring_addrs_dev_ = nullptr;
+    }
+    aicore_ring_addrs_host_ = nullptr;
+
+    // Free shared header region (device only — shadow stays in
+    // dev_to_host_ until clear_mappings).
+    if (shm_dev_ != nullptr) {
+        release_dev(shm_dev_);
+        shm_dev_ = nullptr;
+    }
+
+    // Free remaining host shadows (per-state buffers + shm region).
+    manager_.clear_mappings();
+
+    initialized_ = false;
+    clear_memory_context();
+    LOG_INFO_V0("PMU collector finalized");
 }

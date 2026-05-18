@@ -22,9 +22,12 @@ severity and INFO sub-verbosity:
 
 C++ side uses two axes (severity enum, info_v int) — `_split_threshold()`
 converts the Python integer into that pair, which `Worker.init()` forwards
-to `ChipWorker::init(..., log_level, log_info_v)` once. The platform SO's
-`simpler_init()` then propagates that snapshot to HostLogger, runner state,
-and (onboard only) CANN dlog.
+to `ChipWorker.init(device_id, bins, log_level, log_info_v)` once. The Python
+`ChipWorker.init` wrapper `ctypes.CDLL`s libsimpler_log.so RTLD_GLOBAL and
+calls its `simpler_log_init()` to seed the process-wide HostLogger before the
+C++ side dlopens host_runtime.so; from then on the platform SO reads back
+through `HostLogger::get_instance()` (populating `KernelArgs.log_level` /
+`log_info_v` and, onboard only, syncing CANN dlog inside `simpler_init`).
 
 This module configures the "simpler" logger at import so that an unconfigured
 user gets the V5 default rather than Python's WARNING root inheritance.
@@ -35,7 +38,7 @@ import logging
 # DEFAULT_LOG_THRESHOLD is exposed by the _task_interface nanobind module so
 # Python and C++ share one constant. During a fresh `pip install -e .` the
 # pre-existing .so may be stale or absent, so fall back to the hardcoded
-# value (kept in sync manually with src/{a5,a2a3}/platform/src/host/host_log.h).
+# value (kept in sync manually with src/common/log/host_log.h).
 try:
     from _task_interface import DEFAULT_LOG_THRESHOLD as _NATIVE_DEFAULT  # pyright: ignore[reportMissingImports]
 except (ImportError, AttributeError):
@@ -55,6 +58,22 @@ V9 = 24
 NUL = 60
 
 DEFAULT_THRESHOLD = _NATIVE_DEFAULT  # 20 (V5)
+
+# Register V0..V9 / NUL as Python logging level names so that:
+#   - `logging.LogRecord.levelname` for these tiers prints as "V0".."V9"
+#     instead of the default "Level 18" placeholder.
+#   - `logger.setLevel("V3")` (string form) resolves to 18.
+#   - pytest's own `--log-level` validator (which does
+#     `int(getattr(logging, name.upper(), name))`) accepts `pytest --log-level
+#     v3` — but only if the names exist as module attributes on `logging`.
+#     pytest validates the CLI value before conftest's first `import simpler`,
+#     so the same registration is also mirrored at conftest top-level.
+for _v in range(10):
+    logging.addLevelName(15 + _v, f"V{_v}")
+    setattr(logging, f"V{_v}", 15 + _v)
+logging.addLevelName(NUL, "NUL")
+setattr(logging, "NUL", NUL)
+setattr(logging, "NULL", NUL)  # pytest upcases user's `--log-level null` → NULL
 
 _LOGGER_NAME = "simpler"
 _logger = logging.getLogger(_LOGGER_NAME)

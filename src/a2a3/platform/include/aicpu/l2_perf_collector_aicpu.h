@@ -20,7 +20,6 @@
 #define PLATFORM_AICPU_L2_PERF_COLLECTOR_AICPU_H_
 
 #include "common/l2_perf_profiling.h"
-#include "runtime.h"
 
 // Include platform-specific timestamp implementation
 // Build system selects the correct inner_aicpu.h based on platform:
@@ -31,7 +30,7 @@
 
 /**
  * L2 perf handshake setters — called by the host (sim) or the AICPU kernel
- * entry (onboard) before `l2_perf_aicpu_init_profiling()` so AICPU code can
+ * entry (onboard) before `l2_perf_aicpu_init()` so AICPU code can
  * read perf state without reaching into the generic `Runtime` struct.
  */
 extern "C" void set_platform_l2_perf_base(uint64_t l2_perf_data_base);
@@ -44,19 +43,39 @@ extern "C" bool is_l2_swimlane_enabled();
  *
  * Sets up double buffers for each core and initializes tracking state.
  * Reads the perf device-base pointer published via `set_platform_l2_perf_base()`.
+ * AICPU caches each core's stable AICore staging-ring address from
+ * `L2PerfBufferState[i].aicore_ring_ptr` (host populated it before AICPU
+ * started). AICore receives the same per-core ring through
+ * `KernelArgs::aicore_ring_addr` + `set_aicore_l2_perf_ring()`, so this
+ * routine no longer touches runtime's Handshake.
  *
- * @param runtime Runtime instance pointer (used for worker_count / task_count only)
+ * @param worker_count  Number of AICore workers (cores) to initialize
  */
-void l2_perf_aicpu_init_profiling(Runtime *runtime);
+void l2_perf_aicpu_init(int worker_count);
 
 /**
  * Complete a L2PerfRecord with AICPU-side metadata after AICore task completion
  *
- * Reads l2_perf_buf->count, validates task_id match against the latest record,
- * and fills all AICPU-side fields. Callers must pre-extract fanout into a
- * plain uint64_t array (platform layer cannot depend on runtime linked-list types).
+ * Reads the AICore-published timing from the per-core staging ring at
+ * `dual_issue_slots[expected_reg_task_id % PLATFORM_L2_AICORE_RING_SIZE]`,
+ * validates the task_id match, fills all AICPU-side fields, commits into
+ * the current records buffer, and rotates the records buffer internally
+ * once it fills up. Callers must pre-extract fanout into a plain uint64_t
+ * array (platform layer cannot depend on runtime linked-list types).
  *
- * @param l2_perf_buf              L2PerfBuffer pointer (from handshake l2_perf_records_addr)
+ * Per-core counter accounting:
+ *   total_record_count++       — every commit attempt (success or failure)
+ *   dropped_record_count++     — capacity-driven drop (no free buffer / queue
+ *                                full); actionable via
+ *                                PLATFORM_PROF_BUFFERS_PER_CORE
+ *   mismatch_record_count++    — ring slot/task_id mismatch. The runtime's
+ *                                completion-before-dispatch invariant says
+ *                                this must never happen; if it does, it is a
+ *                                hard error (DEV_ERROR) — surface separately
+ *                                from capacity drops.
+ *
+ * @param core_id               Core index — used to resolve buffer state and update counters
+ * @param thread_idx            Owning AICPU thread (used when rotating records buffer)
  * @param expected_reg_task_id  Register dispatch token (low 32 bits) to validate
  * @param task_id               Task identifier to write (PTO2 encoding or plain id)
  * @param func_id               Kernel function identifier
@@ -67,20 +86,9 @@ void l2_perf_aicpu_init_profiling(Runtime *runtime);
  * @param fanout_count          Number of entries in fanout array (0 if none)
  */
 int l2_perf_aicpu_complete_record(
-    L2PerfBuffer *l2_perf_buf, uint32_t expected_reg_task_id, uint64_t task_id, uint32_t func_id, CoreType core_type,
+    int core_id, int thread_idx, uint32_t expected_reg_task_id, uint64_t task_id, uint32_t func_id, CoreType core_type,
     uint64_t dispatch_time, uint64_t finish_time, const uint64_t *fanout, int32_t fanout_count
 );
-
-/**
- * Switch performance buffer when current buffer is full
- *
- * Checks buffer capacity and switches to alternate buffer if needed.
- *
- * @param runtime Runtime instance pointer
- * @param core_id Core ID
- * @param thread_idx Thread index
- */
-void l2_perf_aicpu_switch_buffer(Runtime *runtime, int core_id, int thread_idx);
 
 /**
  * Flush remaining performance data
@@ -94,25 +102,16 @@ void l2_perf_aicpu_switch_buffer(Runtime *runtime, int core_id, int thread_idx);
 void l2_perf_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, int core_num);
 
 /**
- * Update total task count in performance header
- *
- * Allows dynamic update of total_tasks as orchestrator makes progress.
- * Used by tensormap_and_ringbuffer runtime where task count grows incrementally.
- *
- * @param total_tasks Current total task count
- */
-void l2_perf_aicpu_update_total_tasks(uint32_t total_tasks);
-
-/**
  * Initialize AICPU phase profiling
  *
  * Sets up AicpuPhaseHeader and clears per-thread phase record buffers.
- * Must be called once from thread 0 after l2_perf_aicpu_init_profiling().
+ * Must be called once from thread 0 after l2_perf_aicpu_init().
  *
- * @param runtime Runtime instance pointer
- * @param num_sched_threads Number of scheduler threads
+ * @param worker_count       Number of AICore workers (cores) — used to resolve
+ *                           the phase region's offset relative to the L2Perf base
+ * @param num_sched_threads  Number of scheduler threads
  */
-void l2_perf_aicpu_init_phase_profiling(Runtime *runtime, int num_sched_threads);
+void l2_perf_aicpu_init_phase(int worker_count, int num_sched_threads);
 
 /**
  * Record a single scheduler phase
@@ -128,10 +127,13 @@ void l2_perf_aicpu_init_phase_profiling(Runtime *runtime, int num_sched_threads)
  * @param tasks_processed Number of tasks processed in this batch (scheduler phases), or
  *                        full PTO2 task_id encoding (ring_id << 32) | local_id (orchestrator
  *                        phases in tensormap_and_ringbuffer)
+ * @param extra1, extra2  Phase-specific delta counters (see AicpuPhaseRecord doc).
+ *                        SCHED_DISPATCH uses extra1=pop_hit, extra2=pop_miss; other
+ *                        phases pass 0.
  */
 void l2_perf_aicpu_record_phase(
     int thread_idx, AicpuPhaseId phase_id, uint64_t start_time, uint64_t end_time, uint32_t loop_iter,
-    uint64_t tasks_processed
+    uint64_t tasks_processed, uint32_t extra1 = 0, uint32_t extra2 = 0
 );
 
 /**

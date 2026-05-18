@@ -16,6 +16,8 @@ subprocess per runtime so each gets a clean CANN context. See docs/testing.md.
 
 from __future__ import annotations
 
+import faulthandler
+import logging
 import os
 import signal
 import subprocess
@@ -23,15 +25,33 @@ import sys
 import time
 import typing
 
+# Make simpler's V0..V9 and NUL acceptable to pytest's `--log-level` validator.
+# pytest does `int(getattr(logging, level.upper(), level))`, so the value must
+# exist as a module attribute on `logging` (not just registered via
+# `addLevelName`). Set both — the addLevelName side gives nice formatter output
+# (`%(levelname)s` shows `V3` instead of `Level 18`); the setattr side is what
+# pytest's CLI parser actually consumes.
+for _v in range(10):
+    logging.addLevelName(15 + _v, f"V{_v}")
+    setattr(logging, f"V{_v}", 15 + _v)
+logging.addLevelName(60, "NUL")
+setattr(logging, "NUL", 60)
+# `pytest --log-level null` upcases to "NULL" before the getattr lookup, so
+# expose both spellings.
+setattr(logging, "NULL", 60)
+
 # macOS libomp collision workaround — must run before any import that may
 # transitively load numpy or torch (i.e. before pytest collects scene test
-# goldens). See docs/macos-libomp-collision.md.
+# goldens). See docs/troubleshooting/macos-libomp-collision.md.
 if sys.platform == "darwin":
     os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import pytest  # noqa: E402
 
+from simpler_setup import parallel_scheduler as _ps  # noqa: E402
 from simpler_setup.log_config import configure_logging  # noqa: E402
+from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: E402
+from simpler_setup.scene_test import clear_compile_cache  # noqa: E402
 
 # Exit code used when the session watchdog fires. Matches the GNU `timeout`
 # convention so shell wrappers (e.g. CI) can distinguish timeout from other
@@ -46,9 +66,7 @@ def _parse_device_range(s: str) -> list[int]:
     so both conftest and standalone share the same parser (supports ``0``,
     ``0-7``, ``0,2,5``, and mixed ``0,2-4,7``).
     """
-    from simpler_setup.parallel_scheduler import device_range_to_list  # noqa: PLC0415
-
-    return device_range_to_list(s)
+    return _ps.device_range_to_list(s)
 
 
 class DevicePool:
@@ -126,6 +144,12 @@ def pytest_addoption(parser):
     )
     parser.addoption("--dump-tensor", action="store_true", default=False, help="Dump per-task tensor I/O at runtime")
     parser.addoption(
+        "--enable-dep-gen",
+        action="store_true",
+        default=False,
+        help="Enable dep_gen capture (SubmitTrace ring, first round only)",
+    )
+    parser.addoption(
         "--enable-pmu",
         nargs="?",
         const=2,
@@ -149,6 +173,15 @@ def pytest_addoption(parser):
         choices=["ssh", "https"],
         help="Protocol for cloning pto-isa when --pto-isa-commit is set",
     )
+    parser.addoption(
+        "--require-pto-isa",
+        action="store_true",
+        default=False,
+        help="Abort the session immediately if PTO-ISA can't be resolved/cloned, "
+        "instead of deferring to the per-test lazy path. CI scene-test jobs pass "
+        "this so a transient clone failure fails fast rather than fanning out into "
+        "device subprocesses that each re-clone into a poisoned directory.",
+    )
     # Distinct from pytest-timeout's per-test --timeout (which `.[test]` pulls
     # in on the a2a3 hardware runner); this is session-level.
     parser.addoption(
@@ -160,15 +193,127 @@ def pytest_addoption(parser):
     )
 
 
+def _collect_descendant_pids(pid: int) -> list[int]:
+    """Return all descendant pids of ``pid``, BFS via Linux ``/proc``.
+
+    L3 ``Worker`` forks ChipWorker / SubWorker / next-level children
+    (``python/simpler/worker.py::_start_hierarchical``). When a sim test
+    deadlocks inside one of those forked grandchildren, sending SIGUSR1 only
+    to the dispatched pytest pid is useless — that process is calmly waiting
+    in ``waitpid``; the real deadlock site sees no signal. Walking the tree
+    via ``/proc/<pid>/task/<tid>/children`` lets the timeout handler hit
+    every descendant so faulthandler (which is inherited across ``fork``)
+    fires in the one that's actually stuck.
+
+    Returns ``[]`` on platforms without ``/proc`` (macOS) or if the pid is
+    already gone. Best-effort: races with grandchild exit are silently
+    ignored.
+    """
+    from collections import deque  # noqa: PLC0415 — local import keeps the signal-handler import surface minimal
+
+    out: list[int] = []
+    visited: set[int] = {pid}
+    queue: deque[int] = deque([pid])
+    while queue:
+        cur = queue.popleft()
+        try:
+            task_dir = f"/proc/{cur}/task"
+            tids = os.listdir(task_dir)
+        except (FileNotFoundError, NotADirectoryError, PermissionError):
+            continue
+        for tid in tids:
+            try:
+                with open(f"{task_dir}/{tid}/children") as f:
+                    raw = f.read()
+            except (FileNotFoundError, PermissionError):
+                continue
+            for tok in raw.split():
+                try:
+                    child = int(tok)
+                except ValueError:
+                    continue
+                if child not in visited:
+                    visited.add(child)
+                    out.append(child)
+                    queue.append(child)
+    return out
+
+
 def _install_session_timeout(timeout_s: int) -> None:
+    # Module-level `_ps` import is intentional (rather than a function-local
+    # one): doing `from simpler_setup import parallel_scheduler` inside a
+    # signal handler can deadlock on the import lock if the module hasn't
+    # been imported yet. Hoisting it to the top guarantees the handler only
+    # touches an already-loaded module.
     def _handler(signum, frame):
         print(
-            f"\n{'=' * 40}\n"
-            f"[pytest] TIMEOUT: session exceeded {timeout_s}s "
-            f"({timeout_s // 60}min) limit, aborting\n"
-            f"{'=' * 40}",
+            f"\n{'=' * 40}\n[pytest] TIMEOUT: session exceeded {timeout_s}s ({timeout_s // 60}min) limit\n{'=' * 40}",
             flush=True,
         )
+
+        # If the dispatcher is mid-flight, surface every stuck child:
+        # 1. SIGUSR1 each pid AND its descendants so faulthandler (inherited
+        #    across fork in L3 Worker's ChipWorker/SubWorker children) dumps
+        #    all-thread tracebacks (Python + C frames) into the child's
+        #    stdout — pumped into output_lines.
+        # 2. Briefly let the pump thread drain those bytes (``join`` with a
+        #    short timeout) before reading the tail buffer; otherwise bytes
+        #    sit in the OS pipe and are dropped when SIGTERM closes it.
+        # 3. Print each in-flight job's tail buffer in a HUNG group so the log
+        #    contains the actual cause, not just the timeout banner.
+        # 4. SIGTERM/SIGKILL the children so they don't outlive us as orphans
+        #    holding NPU device state.
+        state = _ps._active_state
+        if state is not None and state.running:
+            descendants: dict[int, list[int]] = {}
+            for p in list(state.running):
+                kin = _collect_descendant_pids(p.pid) if hasattr(signal, "SIGUSR1") else []
+                descendants[p.pid] = kin
+                if not hasattr(signal, "SIGUSR1"):
+                    continue
+                # Signal the dispatched pytest itself, then every descendant
+                # (in BFS order — closer kin first is fine, ordering doesn't
+                # affect the dump).
+                for target_pid in (p.pid, *kin):
+                    try:
+                        os.kill(target_pid, signal.SIGUSR1)
+                    except (ProcessLookupError, OSError):
+                        pass
+
+            time.sleep(2.0)
+
+            now = time.monotonic()
+            for p, rj in list(state.running.items()):
+                elapsed = now - rj.start_time
+                # The pump thread runs continuously and is the actual drain;
+                # the 2 s sleep above already gave faulthandler bytes time to
+                # land in ``output_lines``. ``join`` here only yields the GIL
+                # so the pump's pending ``output_lines.append`` lands before
+                # we read the list. Short timeout — pump will block on the
+                # next ``readline()`` since the child is still alive.
+                pump = getattr(rj, "pump_thread", None)
+                if pump is not None:
+                    pump.join(timeout=0.05)
+                tail = "".join(rj.output_lines[-200:])
+                kin = descendants.get(p.pid, [])
+                kin_str = f" descendants={kin}" if kin else ""
+                print(
+                    f"::group::HUNG {rj.job.label} pid={p.pid} devices={rj.device_ids} elapsed={elapsed:.1f}s{kin_str}",
+                    flush=True,
+                )
+                if tail:
+                    print(tail, end="" if tail.endswith("\n") else "\n", flush=True)
+                print("::endgroup::", flush=True)
+                print(
+                    f"*** HUNG: {rj.job.label} (devices={rj.device_ids}) — expand group above ***",
+                    flush=True,
+                )
+
+            try:
+                _ps._terminate_all(state)
+            except Exception:  # noqa: BLE001
+                pass
+
         os._exit(TIMEOUT_EXIT_CODE)
 
     # signal.alarm / SIGALRM are Unix-only; skip silently on platforms without
@@ -176,6 +321,28 @@ def _install_session_timeout(timeout_s: int) -> None:
     if hasattr(signal, "alarm") and hasattr(signal, "SIGALRM"):
         signal.signal(signal.SIGALRM, _handler)
         signal.alarm(timeout_s)
+
+
+def _install_child_faulthandler() -> None:
+    """In dispatched child pytest processes, let SIGUSR1 dump all-thread stacks.
+
+    The parent dispatcher's session-timeout handler sends SIGUSR1 to every
+    in-flight child before tearing the run down. ``faulthandler.register``
+    runs in the C signal handler, so it works even when the main thread is
+    blocked inside a native call that doesn't release the GIL (NPU runtime,
+    nanobind into C++) — exactly the case Python-level watchdogs miss.
+
+    Always-on ``faulthandler.enable()`` also gives us a stack on real crashes
+    (SIGSEGV/SIGABRT) instead of a silent exit.
+    """
+    faulthandler.enable()
+    if hasattr(signal, "SIGUSR1"):
+        try:
+            faulthandler.register(signal.SIGUSR1, chain=False, all_threads=True)
+        except (ValueError, RuntimeError):
+            # Fails when stdout/stderr can't be duped (rare in child subprocs);
+            # leave faulthandler.enable() in place and continue.
+            pass
 
 
 def pytest_configure(config):
@@ -205,8 +372,10 @@ def pytest_configure(config):
     # need PTO-ISA (e.g. pytest tests/ut on a runner without SSH keys) must not
     # be aborted when the eager clone fails. If an actual scene test later needs
     # PTO-ISA, scene_test.py's lazy path will re-raise the original error.
-    from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: PLC0415
-
+    #
+    # --require-pto-isa flips that: callers that know PTO-ISA is mandatory
+    # (CI scene-test jobs) want the session to die here rather than fan out
+    # into device subprocesses that each re-attempt the clone.
     try:
         root = ensure_pto_isa_root(
             verbose=True,
@@ -215,6 +384,8 @@ def pytest_configure(config):
             update_if_exists=True,
         )
     except OSError as e:
+        if config.getoption("--require-pto-isa"):
+            pytest.exit(f"PTO-ISA required but unavailable: {e}", returncode=pytest.ExitCode.USAGE_ERROR)
         print(f"[pytest] PTO-ISA pre-clone skipped: {e}", file=sys.stderr)
         root = None
     if root:
@@ -223,6 +394,13 @@ def pytest_configure(config):
     timeout = config.getoption("--pto-session-timeout")
     if timeout and timeout > 0:
         _install_session_timeout(timeout)
+
+    # Always register SIGUSR1 → faulthandler. In dispatched child pytest
+    # processes this is what the parent's session-timeout handler relies on
+    # to extract a stack from a hung run. In the parent dispatcher itself
+    # it's harmless and lets a developer query "what is this process doing?"
+    # interactively with `kill -USR1 <pid>`.
+    _install_child_faulthandler()
 
     # xdist worker: bind this process to a single device id from the --device range.
     # The dispatcher (or the user) supplies --device 0-7; xdist spawns N workers
@@ -484,11 +662,9 @@ def _base_pytest_argv(session):
 
 def _resolve_max_parallel(cfg, platform: str, device_ids: list[int]) -> int:
     """Parse the -j/--max-parallel CLI value; 'auto' → platform-aware default."""
-    from simpler_setup.parallel_scheduler import default_max_parallel  # noqa: PLC0415
-
     raw = cfg.getoption("--max-parallel", default="auto")
     if raw in (None, "", "auto"):
-        return default_max_parallel(platform or "", device_ids)
+        return _ps.default_max_parallel(platform or "", device_ids)
     try:
         val = int(raw)
     except (TypeError, ValueError) as e:
@@ -524,8 +700,6 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
     already has to inspect the list to decide whether to dispatch) so
     this function does not walk ``session.items`` a second time.
     """
-    from simpler_setup import parallel_scheduler as _ps  # noqa: PLC0415
-
     cfg = session.config
     device_spec = cfg.getoption("--device", default="0")
     device_ids = _parse_device_range(device_spec)
@@ -721,8 +895,6 @@ def pytest_sessionfinish(session, exitstatus):  # noqa: ARG001
     worker pool) lets those instances die while nanobind is still
     available.
     """
-    from simpler_setup.scene_test import clear_compile_cache  # noqa: PLC0415
-
     clear_compile_cache()
 
 
@@ -838,11 +1010,22 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool):
 
         # Register SubCallable entries from cls.CALLABLE
         sub_ids = {}
+        chip_cids = {}
         for entry in cls.CALLABLE.get("callables", []):
             if "callable" in entry:
                 cid = w.register(entry["callable"])
                 sub_ids[entry["name"]] = cid
+            elif "orchestration" in entry:
+                from simpler_setup.scene_test import _compile_chip_callable_from_spec  # noqa: PLC0415
+
+                name = entry["name"]
+                cache_key = (cls.__qualname__, name, st_platform, runtime)
+                chip = _compile_chip_callable_from_spec(entry, st_platform, runtime, cache_key)
+                cid = w.register(chip)
+                chip_cids[name] = cid
+                chip_cids[f"{name}_sig"] = entry["orchestration"].get("signature", [])
         cls._st_sub_ids = sub_ids
+        cls._st_chip_cids = chip_cids
 
         w.init()
         yield w

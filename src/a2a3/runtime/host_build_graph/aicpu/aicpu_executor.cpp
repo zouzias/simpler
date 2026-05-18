@@ -28,6 +28,10 @@
 #include "runtime.h"
 #include "spin_hint.h"
 
+#ifndef unlikely
+#define unlikely(x) __builtin_expect(!!(x), 0)
+#endif
+
 constexpr int MAX_AICPU_THREADS = PLATFORM_MAX_AICPU_THREADS;
 constexpr int MAX_CORES_PER_THREAD = PLATFORM_MAX_CORES_PER_THREAD;
 constexpr int MAX_CORES = PLATFORM_MAX_CORES;
@@ -106,8 +110,7 @@ struct AicpuExecutor {
     std::atomic<int> finished_count_{0};
 
     // ===== Performance profiling state =====
-    uint64_t dispatch_timestamps_[RUNTIME_MAX_WORKER];   // Per-core AICPU dispatch timestamp
-    uint32_t core_dispatch_counts_[RUNTIME_MAX_WORKER];  // Per-core total dispatched task counter
+    uint64_t dispatch_timestamps_[RUNTIME_MAX_WORKER];  // Per-core AICPU dispatch timestamp
 
     // ===== Methods =====
     int init(Runtime *runtime);
@@ -236,7 +239,7 @@ inline void AicpuExecutor::resolve_task_dependencies(
 // Try to dispatch a task from thread-local queue to a core
 inline bool AicpuExecutor::try_dispatch_task(
     int core_id, uint64_t reg_addr, CoreType core_type, int thread_idx, int *local_queue, int &head, int &ready_count,
-    bool l2_perf_enabled, Runtime &runtime
+    bool l2_perf_enabled, [[maybe_unused]] Runtime &runtime
 ) {
     if (ready_count <= 0) {
         return false;
@@ -247,13 +250,9 @@ inline bool AicpuExecutor::try_dispatch_task(
     head = (head + 1) % MAX_CORES_PER_THREAD;
     ready_count--;
 
-    // Profiling: buffer switch check. Then record the real AICPU dispatch point for this core.
+    // Profiling: record the real AICPU dispatch point for this core. Buffer
+    // rotation is handled inside l2_perf_aicpu_complete_record.
     if (l2_perf_enabled) {
-        core_dispatch_counts_[core_id]++;
-        if (core_dispatch_counts_[core_id] >= PLATFORM_PROF_BUFFER_SIZE - 1) {
-            l2_perf_aicpu_switch_buffer(&runtime, core_id, thread_idx);
-            core_dispatch_counts_[core_id] = 0;
-        }
         dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
     }
 
@@ -324,6 +323,10 @@ int AicpuExecutor::init(Runtime *runtime) {
         core_id_to_reg_addr_[i] = 0;
     }
 
+    if (is_l2_swimlane_enabled()) {
+        l2_perf_aicpu_init(runtime->worker_count);
+    }
+
     // Perform core discovery: handshake with all cores and collect core type information
     int rc = handshake_all_cores(runtime);
     if (rc != 0) {
@@ -349,10 +352,6 @@ int AicpuExecutor::init(Runtime *runtime) {
 
     for (int i = 0; i < RUNTIME_MAX_WORKER; i++) {
         dispatch_timestamps_[i] = 0;
-        core_dispatch_counts_[i] = 0;
-    }
-    if (is_l2_swimlane_enabled()) {
-        l2_perf_aicpu_init_profiling(runtime);
     }
 #if PTO2_PROFILING
     if (is_dump_tensor_enabled()) {
@@ -676,6 +675,11 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
     int verification_warning_count = 0;
     const int MAX_VERIFICATION_WARNINGS = 10;
     bool l2_perf_enabled = is_l2_swimlane_enabled();
+    // PMU runs require single-issue dispatch — overlapping in-flight tasks
+    // pollute per-task PMU counters. Cached at function scope:
+    // is_pmu_enabled() is extern "C" and the compiler cannot hoist it
+    // across the dispatch loop on its own.
+    const bool pmu_active = is_pmu_enabled();
 
     // Extract array pointers as local variables for better readability and performance
     int *cur_ready_queue_aic = cur_ready_queue_aic_[thread_idx];
@@ -725,11 +729,10 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 int prev_running_id = running_task_ids_[core_id];
 
                 // Profiling: when prev_running_id exists, its AICore timing was
-                // written to wip[id & 1] first, so complete it BEFORE the
+                // published to the ring slot first, so complete it BEFORE the
                 // pending task's record to maintain buffer ordering.
                 if (l2_perf_enabled) {
                     uint64_t finish_ts = get_sys_cnt_aicpu();
-                    L2PerfBuffer *l2_perf_buf = reinterpret_cast<L2PerfBuffer *>(h->l2_perf_records_addr);
 
                     if (prev_running_id != AICPU_TASK_INVALID) {
                         Task *prev_task = &runtime.tasks[prev_running_id];
@@ -738,11 +741,11 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                             fanout_arr[i] = static_cast<uint64_t>(prev_task->fanout[i]);
                         }
                         if (l2_perf_aicpu_complete_record(
-                                l2_perf_buf, static_cast<uint32_t>(prev_running_id),
+                                core_id, thread_idx, static_cast<uint32_t>(prev_running_id),
                                 static_cast<uint64_t>(prev_running_id), prev_task->func_id, h->core_type,
                                 dispatch_timestamps_[core_id], finish_ts, fanout_arr, prev_task->fanout_count
                             ) != 0) {
-                            DEV_ERROR(
+                            LOG_ERROR(
                                 "Core %d: l2_perf_aicpu_complete_record failed for implicit task %d", core_id,
                                 prev_running_id
                             );
@@ -757,11 +760,11 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                         fanout_arr[i] = static_cast<uint64_t>(task->fanout[i]);
                     }
                     if (l2_perf_aicpu_complete_record(
-                            l2_perf_buf, static_cast<uint32_t>(completed_task_id),
+                            core_id, thread_idx, static_cast<uint32_t>(completed_task_id),
                             static_cast<uint64_t>(completed_task_id), task->func_id, h->core_type,
                             dispatch_timestamps_[core_id], finish_ts, fanout_arr, task->fanout_count
                         ) != 0) {
-                        DEV_ERROR(
+                        LOG_ERROR(
                             "Core %d: l2_perf_aicpu_complete_record failed for task %d", core_id, completed_task_id
                         );
                     }
@@ -841,18 +844,17 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                     // Profiling: complete the implicit task's AICore record
                     if (l2_perf_enabled) {
                         uint64_t finish_ts = get_sys_cnt_aicpu();
-                        L2PerfBuffer *l2_perf_buf = reinterpret_cast<L2PerfBuffer *>(h->l2_perf_records_addr);
                         Task *prev_task = &runtime.tasks[prev_running_id];
                         uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
                         for (int i = 0; i < prev_task->fanout_count; i++) {
                             fanout_arr[i] = static_cast<uint64_t>(prev_task->fanout[i]);
                         }
                         if (l2_perf_aicpu_complete_record(
-                                l2_perf_buf, static_cast<uint32_t>(prev_running_id),
+                                core_id, thread_idx, static_cast<uint32_t>(prev_running_id),
                                 static_cast<uint64_t>(prev_running_id), prev_task->func_id, h->core_type,
                                 dispatch_timestamps_[core_id], finish_ts, fanout_arr, prev_task->fanout_count
                             ) != 0) {
-                            DEV_ERROR(
+                            LOG_ERROR(
                                 "Core %d: l2_perf_aicpu_complete_record failed for implicit task %d", core_id,
                                 prev_running_id
                             );
@@ -887,18 +889,17 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
 
                 if (l2_perf_enabled) {
                     uint64_t finish_ts = get_sys_cnt_aicpu();
-                    L2PerfBuffer *l2_perf_buf = reinterpret_cast<L2PerfBuffer *>(h->l2_perf_records_addr);
                     Task *task = &runtime.tasks[completed_task_id];
                     uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
                     for (int i = 0; i < task->fanout_count; i++) {
                         fanout_arr[i] = static_cast<uint64_t>(task->fanout[i]);
                     }
                     if (l2_perf_aicpu_complete_record(
-                            l2_perf_buf, static_cast<uint32_t>(completed_task_id),
+                            core_id, thread_idx, static_cast<uint32_t>(completed_task_id),
                             static_cast<uint64_t>(completed_task_id), task->func_id, h->core_type,
                             dispatch_timestamps_[core_id], finish_ts, fanout_arr, task->fanout_count
                         ) != 0) {
-                        DEV_ERROR(
+                        LOG_ERROR(
                             "Core %d: l2_perf_aicpu_complete_record failed for task %d", core_id, completed_task_id
                         );
                     }
@@ -939,14 +940,11 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 }
             }
 
-            // Case 4: Dispatch new task if pending slot is available
-            // With PTO2_DISABLE_DUAL_ISSUE=1, additionally require the running
-            // slot to be empty so each core has at most one outstanding task.
-#if PTO2_DISABLE_DUAL_ISSUE
-            if (pending_task_ids_[core_id] == AICPU_TASK_INVALID && running_task_ids_[core_id] == AICPU_TASK_INVALID) {
-#else
-            if (pending_task_ids_[core_id] == AICPU_TASK_INVALID) {
-#endif
+            // Case 4: Dispatch new task if pending slot is available. When PMU
+            // is active we additionally require the running slot to be empty —
+            // see pmu_active comment above the dispatch loop.
+            if (pending_task_ids_[core_id] == AICPU_TASK_INVALID &&
+                (!unlikely(pmu_active) || running_task_ids_[core_id] == AICPU_TASK_INVALID)) {
                 if (h->core_type == CoreType::AIC && cur_aic_ready_count > 0) {
                     if (try_dispatch_task(
                             core_id, reg_addr, CoreType::AIC, thread_idx, cur_ready_queue_aic, cur_aic_head,
@@ -1160,7 +1158,6 @@ void AicpuExecutor::deinit(Runtime *runtime) {
 
     for (int i = 0; i < RUNTIME_MAX_WORKER; i++) {
         dispatch_timestamps_[i] = 0;
-        core_dispatch_counts_[i] = 0;
         pending_task_ids_[i] = AICPU_TASK_INVALID;
         running_task_ids_[i] = AICPU_TASK_INVALID;
         core_first_dispatch_[i] = true;

@@ -10,6 +10,7 @@
  */
 
 #include "aicore/aicore.h"
+#include "aicore/aicore_profiling_state.h"
 #include "aicore/l2_perf_collector_aicore.h"
 #include "aicore/pmu_collector_aicore.h"
 #include "common/l2_perf_profiling.h"
@@ -53,9 +54,15 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
 
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
 
-    bool l2_perf_enabled = GET_PROFILING_FLAG(my_hank->enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE);
-    bool dump_tensor_enabled = GET_PROFILING_FLAG(my_hank->enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
-    bool pmu_enabled = GET_PROFILING_FLAG(my_hank->enable_profiling_flag, PROFILING_FLAG_PMU);
+    uint32_t enable_profiling_flag = get_aicore_profiling_flag();
+    bool l2_perf_enabled = GET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE);
+    bool dump_tensor_enabled = GET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
+    bool pmu_enabled = GET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
+
+    // Per-core staging ring is published once at kernel entry from
+    // KernelArgs::aicore_ring_addr — cache the pointer locally here so the
+    // hot loop never re-reads platform state.
+    __gm__ L2PerfAicoreRing *l2_perf_ring = l2_perf_enabled ? get_aicore_l2_perf_ring() : nullptr;
 
     volatile uint32_t task_id = AICPU_IDLE_TASK_ID;
     volatile uint32_t last_task_id = AICPU_IDLE_TASK_ID;
@@ -95,10 +102,8 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             }
 
             if (l2_perf_enabled) {
-                dcci(my_hank, SINGLE_CACHE_LINE);
                 uint64_t end_time = get_sys_cnt_aicore();
-                __gm__ L2PerfBuffer *l2_perf_buf = (__gm__ L2PerfBuffer *)my_hank->l2_perf_records_addr;
-                l2_perf_aicore_record_task(l2_perf_buf, actual_task_id, start_time, end_time);
+                l2_perf_aicore_record_task(l2_perf_ring, actual_task_id, start_time, end_time);
             }
 
             last_task_id = task_id;

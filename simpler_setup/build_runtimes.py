@@ -73,6 +73,7 @@ def build_all(
     lib_dir: Path,
     cache_dir: Path,
     platforms: Optional[list] = None,
+    clone_protocol: str = "ssh",
 ) -> None:
     """Build all runtime variants for the given platforms.
 
@@ -80,6 +81,9 @@ def build_all(
         lib_dir: Final binary output directory (lib/).
         cache_dir: Persistent cmake build directory (build/cache/).
         platforms: List of platform strings. None = auto-detect.
+        clone_protocol: Protocol used by ensure_pto_isa_root() when an
+            onboard platform needs the pto-isa headers and PTO_ISA_ROOT is
+            not pre-set. Mirrors conftest's --clone-protocol flag.
     """
     # Override default paths to respect CLI args
     RuntimeBuilder._LIB_DIR = lib_dir
@@ -94,6 +98,38 @@ def build_all(
 
     logger.info(f"Building for platforms: {', '.join(platforms)}")
 
+    # a2a3 onboard host_runtime hard-depends on pto-isa headers + CANN-9.0
+    # aclnn syms (cf. src/a2a3/platform/onboard/host/CMakeLists.txt
+    # SIMPLER_ENABLE_PTO_SDMA_WORKSPACE marker). Resolve PTO_ISA_ROOT now so
+    # the protocol declared on the CLI (and surfaced in the top-level
+    # CMakeLists invocation) is the one actually used, instead of relying on
+    # the fallback in RuntimeCompiler._init_a2a3. No-ops when PTO_ISA_ROOT
+    # is already set. Skipped when only sim platforms are being built.
+    if "a2a3" in platforms:
+        from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: PLC0415
+
+        os.environ["PTO_ISA_ROOT"] = ensure_pto_isa_root(clone_protocol=clone_protocol, verbose=True)
+
+    # libsimpler_log.so and libcpu_sim_context.so are process-global (one per
+    # host toolchain, not per arch/variant) — build them once before iterating
+    # platforms. cpu_sim_context is only needed when building any sim platform.
+    if platforms:
+        logger.info("Building simpler_log (process-global)...")
+        try:
+            RuntimeBuilder(platform=platforms[0]).ensure_simpler_log(build=True)
+        except Exception as e:
+            logger.error(f"Failed to build simpler_log: {e}")
+            raise
+
+        sim_platforms = [p for p in platforms if parse_platform(p)[1] == "sim"]
+        if sim_platforms:
+            logger.info("Building cpu_sim_context (process-global)...")
+            try:
+                RuntimeBuilder(platform=sim_platforms[0]).ensure_sim_context(build=True)
+            except Exception as e:
+                logger.error(f"Failed to build cpu_sim_context: {e}")
+                raise
+
     for platform in platforms:
         arch, variant = parse_platform(platform)
         runtimes = discover_runtimes(arch)
@@ -107,14 +143,6 @@ def build_all(
         except (ValueError, FileNotFoundError) as e:
             logger.warning(f"  {platform}: cannot initialize builder: {e}")
             continue
-
-        if variant == "sim":
-            logger.info(f"  Building {platform}/sim_context...")
-            try:
-                builder.ensure_sim_context(build=True)
-            except Exception as e:
-                logger.error(f"  Failed to build {platform}/sim_context: {e}")
-                raise
 
         for runtime_name in runtimes:
             logger.info(f"  Building {platform}/{runtime_name}...")
@@ -149,6 +177,15 @@ def main():
         action="store_true",
         help="List buildable platforms and exit",
     )
+    parser.add_argument(
+        "--clone-protocol",
+        choices=["ssh", "https"],
+        default="ssh",
+        help=(
+            "Protocol for cloning pto-isa when an onboard a2a3 build needs it "
+            "and PTO_ISA_ROOT is not pre-set (default: ssh, matching conftest)"
+        ),
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -172,6 +209,7 @@ def main():
         lib_dir=args.lib_dir,
         cache_dir=args.cache_dir,
         platforms=args.platforms,
+        clone_protocol=args.clone_protocol,
     )
 
 

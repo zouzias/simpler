@@ -105,20 +105,28 @@ The PTO Runtime consists of **three separate programs** that communicate through
 DeviceRunner runner;
 void *ptr = runner.allocate_tensor(bytes);
 runner.copy_to_device(dev_ptr, host_ptr, bytes);
-runner.run(runtime, block_dim, device_id, aicpu_binary, aicore_binary, launch_aicpu_num);
+runner.set_executors(aicpu_binary, aicore_binary);   // once, at init time
+runner.run(runtime, block_dim, launch_aicpu_num);
 runner.finalize();
 ```
 
 ### Layer 2: C API (`src/common/worker/pto_runtime_c_api.h`)
 
 ```c
+// libsimpler_log.so (RTLD_GLOBAL, loaded first by the Python wrapper):
+simpler_log_init(log_level, log_info_v);              // seed HostLogger once
+
+// host_runtime.so (RTLD_LOCAL, loaded after):
 DeviceContextHandle ctx = create_device_context();
-set_device(ctx, device_id);
+simpler_init(ctx, device_id,                          // attach + binary takeover
+             aicpu_binary, aicpu_size,
+             aicore_binary, aicore_size);
 size_t size = get_runtime_size();
-run_runtime(ctx, runtime, callable, args, block_dim,
-            aicpu_thread_num, device_id,
-            aicpu_binary, aicpu_size, aicore_binary, aicore_size,
-            enable_l2_swimlane, enable_dump_tensor, enable_pmu);
+prepare_callable(ctx, cid, callable);                 // one-time per callable
+run_prepared(ctx, runtime, cid, args, block_dim,      // per-launch — no binaries
+             aicpu_thread_num,
+             enable_l2_swimlane, enable_dump_tensor, enable_pmu, output_prefix);
+unregister_callable(ctx, cid);
 finalize_device(ctx);
 destroy_device_context(ctx);
 ```
@@ -129,8 +137,7 @@ destroy_device_context(ctx);
 from simpler.task_interface import ChipWorker, ChipCallable, ChipStorageTaskArgs, CallConfig
 
 worker = ChipWorker()
-worker.init(host_lib_path, aicpu_path, aicore_path, sim_context_lib_path="")
-worker.set_device(device_id)
+worker.init(device_id=0, bins=bins)   # bins = RuntimeBuilder(platform).get_binaries(...)
 
 config = CallConfig()
 config.block_dim = 24
@@ -171,20 +178,27 @@ Python test_*.py (SceneTestCase)
   ├─→ KernelCompiler(platform).compile_orchestration(runtime, source) → orch .so
   │
   └─→ ChipWorker()
-       └─→ init(host_path, aicpu_path, aicore_path)
-            └─→ dlopen(host.so) → resolve C API symbols via dlsym
+       └─→ init(device_id, bins)                          # Python wrapper
+            ├─→ ctypes.CDLL(libsimpler_log.so, RTLD_GLOBAL)   # once per process
+            ├─→ simpler_log_init(log_level, log_info_v) → HostLogger seeded
+            ├─→ ctypes.CDLL(libcpu_sim_context.so, RTLD_GLOBAL)  # sim only, once
+            └─→ _ChipWorker.init(host_path, aicpu_path, aicore_path, device_id)  # C++
+                 ├─→ dlopen(host.so, RTLD_LOCAL) → resolve C API symbols via dlsym
+                 ├─→ create_device_context() → DeviceContextHandle
+                 └─→ simpler_init(ctx, device_id, aicpu*, aicpu_size, aicore*, aicore_size)
+                      ├─→ (onboard) dlog_setlevel(HostLogger.level())   # before context open
+                      ├─→ DeviceRunner::attach_current_thread(device_id)
+                      │    ├─→ rtSetDevice(device_id) on onboard
+                      │    └─→ pto_cpu_sim_bind+acquire on sim
+                      └─→ DeviceRunner::set_executors(aicpu, aicore)
 ```
 
 ### 2. Initialization Phase
 
-```text
-worker.set_device(device_id)
-  │
-  └─→ create_device_context() → DeviceContextHandle
-       └─→ set_device(ctx, device_id)
-            ├─→ Initialize device (CANN on hardware, no-op on sim)
-            └─→ Allocate device streams
-```
+The thread that called `init()` is now attached to `device_id`. Streams are
+created lazily on the first `run()` call (`prepare_run_context`). Subsequent
+device-ops (`malloc`, `copy_to`, `copy_from`, `free`) reuse that per-thread
+binding — they must be called from the same thread that called `init()`.
 
 ### 3. Execution Phase
 
@@ -193,7 +207,8 @@ worker.run(callable, args, CallConfig(block_dim, aicpu_thread_num))
   │
   └─→ run_runtime(ctx, runtime, callable, args, ...)
        │
-       ├─→ Upload kernel binaries (upload_kernel_binary per func_id)
+       ├─→ Upload the entire ChipCallable buffer (upload_chip_callable_buffer)
+       │      then fill func_id_to_addr_[fid] = chip_dev + storage_offset + child_offset(i)
        ├─→ Allocate device tensors via MemoryAllocator
        ├─→ Copy input data to device
        ├─→ Build task graph with dependencies

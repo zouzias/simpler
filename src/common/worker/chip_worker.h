@@ -28,37 +28,49 @@ public:
     ChipWorker(const ChipWorker &) = delete;
     ChipWorker &operator=(const ChipWorker &) = delete;
 
-    /// Bind the runtime library and cache platform binaries.
-    /// Can only be called once per lifetime — the runtime cannot be changed.
-    /// `log_level` (0=DEBUG..4=NUL) and `log_info_v` (0..9) are pushed into
-    /// HostLogger + runner state and (onboard) into CANN dlog at this point;
-    /// they reflect the user's `simpler` Python logger at Worker.init() time
-    /// and are then fixed for this ChipWorker's lifetime.
+    /// Bind the runtime library, cache platform binaries, and attach the
+    /// calling thread to `device_id`. Can only be called once per lifetime —
+    /// the runtime and device cannot be changed after init.
+    ///
+    /// The process-wide RTLD_GLOBAL bootstrap loads (libsimpler_log.so, and on
+    /// sim libcpu_sim_context.so — plus seeding HostLogger via simpler_log_init)
+    /// are the caller's responsibility and must already have happened before
+    /// this call: host_runtime.so resolves its undefined HostLogger /
+    /// unified_log_* (and, on sim, sim_context_*) symbols against those
+    /// globals. The Python `ChipWorker` wrapper does this with `ctypes.CDLL(...,
+    /// mode=RTLD_GLOBAL)`.
     void init(
-        const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
-        const std::string &sim_context_lib_path = "", int log_level = 1, int log_info_v = 5
+        const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path, int device_id
     );
-
-    /// Set the target NPU device. Requires init() first.
-    /// Can be called after reset_device() to switch to a different device.
-    void set_device(int device_id);
-
-    /// Release device resources only. The runtime binding remains intact.
-    /// After this, set_device() can be called again with a new device ID.
-    void reset_device();
 
     /// Tear down everything: device resources and runtime library.
     /// Terminal — the object cannot be reused after this.
     void finalize();
 
-    // IWorker: build a ChipStorageTaskArgs POD from `args` and execute the
-    // runtime synchronously. `callable` is a ChipCallable buffer pointer
-    // cast to uint64.
-    void run(uint64_t callable, TaskArgsView args, const CallConfig &config) override;
+    // IWorker: launch a cid previously staged via prepare_callable.
+    // Materializes a ChipStorageTaskArgs from `args` (one memcpy of T*40B + S*8B
+    // into a stack POD), then delegates to the overload below.
+    void run(int32_t callable_id, TaskArgsView args, const CallConfig &config) override;
+    // Same launch, but the caller already holds the runtime.so-ABI POD —
+    // skip the view→storage memcpy and hand the pointer straight to the C ABI.
+    // Used by the ChipStorageTaskArgs path in the nanobind binding.
+    void run(int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config);
 
-    // Direct invocation (used by Python wrapper and internal tests) — bypasses
-    // the TaskArgsView path and takes a ready-made ChipStorageTaskArgs POD.
-    void run(const void *callable, const void *args, const CallConfig &config);
+    // Per-callable_id preparation. Requires init() first and a callable_id
+    // in [0, MAX_REGISTERED_CALLABLE_IDS) (cap 64).
+    void prepare_callable(int32_t callable_id, const void *callable);
+    void unregister_callable(int32_t callable_id);
+
+    /// Number of distinct callable_ids the AICPU has been asked to dlopen for
+    /// on the bound device. Returns 0 when not initialized or the runtime
+    /// variant has no per-cid registration support. Used by tests to assert
+    /// that prepare_callable + repeated run do not trigger redundant
+    /// AICPU dlopens.
+    size_t aicpu_dlopen_count() const;
+
+    /// Number of host-side dlopens (host_build_graph variant). Mirrors
+    /// `aicpu_dlopen_count` for the trb path; returns 0 on device-orch variants.
+    size_t host_dlopen_count() const;
 
     uint64_t malloc(size_t size);
     void free(uint64_t ptr);
@@ -90,22 +102,23 @@ public:
 
     int device_id() const { return device_id_; }
     bool initialized() const { return initialized_; }
-    bool device_set() const { return device_set_; }
 
 private:
     using CreateDeviceContextFn = void *(*)();
     using DestroyDeviceContextFn = void (*)(void *);
-    using SetDeviceFn = int (*)(void *, int);
     using DeviceMallocCtxFn = void *(*)(void *, size_t);
     using DeviceFreeCtxFn = void (*)(void *, void *);
     using CopyToDeviceCtxFn = int (*)(void *, void *, const void *, size_t);
     using CopyFromDeviceCtxFn = int (*)(void *, void *, const void *, size_t);
     using GetRuntimeSizeFn = size_t (*)();
-    using RunRuntimeFn = int (*)(
-        void *, void *, const void *, const void *, int, int, int, const uint8_t *, size_t, const uint8_t *, size_t,
-        int, int, int, const char *
-    );
-    using SimplerInitFn = void (*)(void *, int, int);
+    // From host_runtime.so. Single platform-side init that does (a) thread
+    // attach + device-id record, (b) executor binary takeover, (c) onboard
+    // CANN dlog sync. Reads the current log level off HostLogger itself.
+    using SimplerInitFn = int (*)(void *, int, const uint8_t *, size_t, const uint8_t *, size_t);
+    using PrepareCallableFn = int (*)(void *, int32_t, const void *);
+    using RunPreparedFn = int (*)(void *, void *, int32_t, const void *, int, int, int, int, int, int, const char *);
+    using UnregisterCallableFn = int (*)(void *, int32_t);
+    using GetAicpuDlopenCountFn = size_t (*)(void *);
     using FinalizeDeviceFn = int (*)(void *);
     using EnsureAclReadyFn = int (*)(void *, int);
     using CreateCommStreamFn = void *(*)(void *);
@@ -120,14 +133,17 @@ private:
     void *lib_handle_ = nullptr;
     CreateDeviceContextFn create_device_context_fn_ = nullptr;
     DestroyDeviceContextFn destroy_device_context_fn_ = nullptr;
-    SetDeviceFn set_device_fn_ = nullptr;
     DeviceMallocCtxFn device_malloc_ctx_fn_ = nullptr;
     DeviceFreeCtxFn device_free_ctx_fn_ = nullptr;
     CopyToDeviceCtxFn copy_to_device_ctx_fn_ = nullptr;
     CopyFromDeviceCtxFn copy_from_device_ctx_fn_ = nullptr;
     GetRuntimeSizeFn get_runtime_size_fn_ = nullptr;
-    RunRuntimeFn run_runtime_fn_ = nullptr;
     SimplerInitFn simpler_init_fn_ = nullptr;
+    PrepareCallableFn prepare_callable_fn_ = nullptr;
+    RunPreparedFn run_prepared_fn_ = nullptr;
+    UnregisterCallableFn unregister_callable_fn_ = nullptr;
+    GetAicpuDlopenCountFn get_aicpu_dlopen_count_fn_ = nullptr;
+    GetAicpuDlopenCountFn get_host_dlopen_count_fn_ = nullptr;
     FinalizeDeviceFn finalize_device_fn_ = nullptr;
     EnsureAclReadyFn ensure_acl_ready_fn_ = nullptr;
     CreateCommStreamFn create_comm_stream_fn_ = nullptr;
@@ -146,11 +162,13 @@ private:
     void *comm_stream_ = nullptr;
 
     std::vector<uint8_t> runtime_buf_;
-    std::vector<uint8_t> aicpu_binary_;
-    std::vector<uint8_t> aicore_binary_;
+    // device_id_ is set once in init() and never modified afterward. All
+    // ChipWorker callers run on the thread that called init() (the same
+    // thread is the only one that subsequently calls malloc / copy_to /
+    // run / finalize), so plain `int` is sufficient — no cross-thread
+    // synchronization required.
     int device_id_ = -1;
     bool initialized_ = false;
-    bool device_set_ = false;
     bool finalized_ = false;
 };
 

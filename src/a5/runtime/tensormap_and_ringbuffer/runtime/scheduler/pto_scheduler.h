@@ -14,7 +14,7 @@
  *
  * The Scheduler is responsible for:
  * 1. Maintaining per-resource-shape ready queues
- * 2. Tracking task state (PENDING -> READY -> RUNNING -> COMPLETED -> CONSUMED)
+ * 2. Tracking task state (PENDING -> COMPLETED -> CONSUMED)
  * 3. Managing fanin/fanout refcounts for dependency resolution
  * 4. Advancing last_task_alive for heap reclamation
  * 5. Two-stage mixed-task completion (subtask done bits → mixed-task complete)
@@ -504,7 +504,7 @@ static_assert(sizeof(PTO2SpscQueue) == 256, "PTO2SpscQueue must be exactly 4 cac
 /**
  * Statistics returned by mixed-task completion processing
  */
-struct PTO2CompletionStats {
+struct CompletionStats {
     int32_t fanout_edges;       // Number of fanout edges traversed (notify consumers)
     int32_t tasks_enqueued;     // Number of consumers that became READY
     int32_t fanin_edges;        // Number of fanin edges traversed (release producers)
@@ -565,6 +565,10 @@ struct PTO2SchedulerState {
     // Ready queues remain global (scheduling is ring-agnostic)
     PTO2ReadyQueue ready_queues[PTO2_NUM_RESOURCE_SHAPES];
 
+    // Dependency-only tasks (active_mask is empty, shape == DUMMY). Drained by
+    // the dispatch loop and completed inline -- never goes to AICore.
+    PTO2ReadyQueue dummy_ready_queue;
+
     // Wiring subsystem — groups all wiring-related state for cache-line isolation.
     //
     // Three cache-line regions by writer:
@@ -593,7 +597,7 @@ struct PTO2SchedulerState {
     );
     static_assert(sizeof(WiringState) == 576, "WiringState must be exactly 9 cache lines (576B)");
 
-    alignas(64) PTO2AsyncWaitList async_wait_list;
+    alignas(64) AsyncWaitList async_wait_list;
 
     // Statistics (cold path, isolated from hot-path fields)
 #if PTO2_SCHED_PROFILING
@@ -655,6 +659,20 @@ struct PTO2SchedulerState {
         return wired;
     }
 
+    // Route a ready slot to the right global queue. Dummy tasks (empty
+    // active_mask) live in dummy_ready_queue; everything else goes to the
+    // per-shape ready_queues[]. Used by paths that do not have a thread-local
+    // ready buffer (e.g. wiring). See push_ready_routed_local for the
+    // dispatch-time fast path.
+    void push_ready_routed(PTO2TaskSlotState *slot_state) {
+        PTO2ResourceShape shape = slot_state->active_mask.to_shape();
+        if (shape == PTO2ResourceShape::DUMMY) {
+            dummy_ready_queue.push(slot_state);
+        } else {
+            ready_queues[static_cast<int32_t>(shape)].push(slot_state);
+        }
+    }
+
     /**
      * Wire fanout edges for a single task. Sets fanin_count, acquires each
      * producer's fanout_lock, allocates dep_pool entries for live producers,
@@ -680,11 +698,11 @@ struct PTO2SchedulerState {
             int32_t init_rc = early_finished + 1;
             int32_t new_rc = ws->fanin_refcount.fetch_add(init_rc, std::memory_order_acq_rel) + init_rc;
             if (new_rc >= ws->fanin_count) {
-                ready_queues[static_cast<int32_t>(ws->active_mask.to_shape())].push(ws);
+                push_ready_routed(ws);
             }
         } else {
             ws->fanin_refcount.fetch_add(1, std::memory_order_acq_rel);
-            ready_queues[static_cast<int32_t>(ws->active_mask.to_shape())].push(ws);
+            push_ready_routed(ws);
         }
 
         ws->dep_pool_mark = rss.dep_pool.top;
@@ -775,8 +793,12 @@ struct PTO2SchedulerState {
         if (new_refcount == slot_state.fanin_count) {
             // Local-first: try per-CoreType thread-local buffer before global queue
             // Route by active_mask: AIC-containing tasks → buf[0], AIV-only → buf[1]
+            // DUMMY shape is out of range for local_bufs (sized PTO2_NUM_RESOURCE_SHAPES);
+            // dummy slots bypass the local fast path and go straight to dummy_ready_queue.
             PTO2ResourceShape shape = slot_state.active_mask.to_shape();
-            if (!local_bufs || !local_bufs[static_cast<int32_t>(shape)].try_push(&slot_state)) {
+            if (shape == PTO2ResourceShape::DUMMY) {
+                dummy_ready_queue.push(&slot_state);
+            } else if (!local_bufs || !local_bufs[static_cast<int32_t>(shape)].try_push(&slot_state)) {
                 ready_queues[static_cast<int32_t>(shape)].push(&slot_state);
             }
             return true;
@@ -793,18 +815,17 @@ struct PTO2SchedulerState {
         atomic_count += 1;  // fanin_refcount.fetch_add
 
         if (new_refcount == slot_state.fanin_count) {
-            PTO2TaskState expected = PTO2_TASK_PENDING;
-            if (slot_state.task_state.compare_exchange_strong(
-                    expected, PTO2_TASK_READY, std::memory_order_acq_rel, std::memory_order_acquire
-                )) {
-                atomic_count += 1;  // CAS(task_state PENDING→READY)
-                // Local-first: try per-CoreType thread-local buffer before global queue
-                PTO2ResourceShape shape = slot_state.active_mask.to_shape();
-                if (!local_bufs || !local_bufs[static_cast<int32_t>(shape)].try_push(&slot_state)) {
-                    ready_queues[static_cast<int32_t>(shape)].push(&slot_state, atomic_count, push_wait);
-                }
-                return true;
+            // Local-first: try per-CoreType thread-local buffer before global queue.
+            // Dummy slots bypass local_bufs (out-of-range for PTO2_NUM_RESOURCE_SHAPES)
+            // and go straight to dummy_ready_queue; use the profiling-aware push so
+            // atomic_count / push_wait stay consistent with the non-dummy path.
+            PTO2ResourceShape shape = slot_state.active_mask.to_shape();
+            if (shape == PTO2ResourceShape::DUMMY) {
+                dummy_ready_queue.push(&slot_state, atomic_count, push_wait);
+            } else if (!local_bufs || !local_bufs[static_cast<int32_t>(shape)].try_push(&slot_state)) {
+                ready_queues[static_cast<int32_t>(shape)].push(&slot_state, atomic_count, push_wait);
             }
+            return true;
         }
         return false;
     }
@@ -880,7 +901,7 @@ struct PTO2SchedulerState {
      * Handles fanout notification, fanin release, and self-consumption check.
      */
 #if PTO2_SCHED_PROFILING
-    PTO2CompletionStats
+    CompletionStats
 #else
     void
 #endif
@@ -893,7 +914,7 @@ struct PTO2SchedulerState {
         PTO2LocalReadyBuffer *local_bufs = nullptr
     ) {
 #if PTO2_SCHED_PROFILING
-        PTO2CompletionStats stats = {0, 0, 0, true};
+        CompletionStats stats = {0, 0, 0, true};
 #endif
 #if PTO2_SCHED_PROFILING
         extern uint64_t g_sched_lock_cycle[], g_sched_fanout_cycle[];
@@ -997,20 +1018,19 @@ struct PTO2SchedulerState {
 // See init()/destroy()/print_stats()/print_queues() below the struct definition.
 
 template <bool Profiling>
-inline PTO2AsyncPollResult PTO2AsyncWaitList::poll_and_complete(
-    volatile PTO2CompletionIngressQueue *completion_ingress, PTO2SchedulerState *sched,
-    PTO2LocalReadyBuffer *local_bufs, PTO2TaskSlotState **deferred_release_slot_states, int32_t &deferred_release_count,
-    int32_t deferred_release_capacity
+inline AsyncPollResult AsyncWaitList::poll_and_complete(
+    volatile AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched, PTO2LocalReadyBuffer *local_bufs,
+    PTO2TaskSlotState **deferred_release_slot_states, int32_t &deferred_release_count, int32_t deferred_release_capacity
 #if PTO2_SCHED_PROFILING
     ,
     int thread_idx
 #endif
 ) {
-    PTO2AsyncPollResult result;
+    AsyncPollResult result;
     if (!try_lock()) return result;
 
     int32_t drain_err = PTO2_ERROR_NONE;
-    drain_completion_ingress_locked(completion_ingress, drain_err);
+    drain_aicore_completion_mailbox_locked(aicore_mailbox, drain_err);
     if (drain_err != PTO2_ERROR_NONE) {
         result.error_code = drain_err;
         unlock();
@@ -1018,18 +1038,18 @@ inline PTO2AsyncPollResult PTO2AsyncWaitList::poll_and_complete(
     }
 
     for (int32_t i = count - 1; i >= 0; --i) {
-        PTO2AsyncWaitEntry &entry = entries[i];
+        AsyncWaitEntry &entry = entries[i];
         for (int32_t c = 0; c < entry.condition_count; c++) {
-            PTO2CompletionCondition &cond = entry.conditions[c];
+            CompletionCondition &cond = entry.conditions[c];
             if (cond.satisfied) continue;
-            PTO2CompletionPollResult poll = cond.test();
-            if (poll.state == PTO2CompletionPollState::FAILED) {
+            CompletionPollResult poll = cond.test();
+            if (poll.state == CompletionPollState::FAILED) {
                 result.error_code = poll.error_code;
                 result.failed_slot_state = entry.slot_state;
                 unlock();
                 return result;
             }
-            if (poll.state == PTO2CompletionPollState::READY) {
+            if (poll.state == CompletionPollState::READY) {
                 cond.satisfied = true;
                 entry.waiting_completion_count--;
             }
@@ -1059,12 +1079,6 @@ inline PTO2AsyncPollResult PTO2AsyncWaitList::poll_and_complete(
     unlock();
     return result;
 }
-
-// =============================================================================
-// Debug Utilities (cold path, defined in pto_scheduler.cpp)
-// =============================================================================
-
-const char *task_state_name(PTO2TaskState state);
 
 // =============================================================================
 // Scheduler Profiling Data

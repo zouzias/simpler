@@ -39,23 +39,23 @@
 #include "tensor.h"
 #include "tensor_arg.h"
 
-// Task arguments
-#define MAX_TENSOR_ARGS 16         // Maximum tensor arguments per task
-#define MAX_SCALAR_ARGS 32         // Maximum scalar arguments per task
-#define PTO2_MAX_OUTPUTS 16        // Maximum outputs per task
-#define PTO2_MAX_INPUTS 16         // Maximum inputs per task
-#define PTO2_MAX_INOUTS 8          // Maximum in-out args per task
-#define PTO2_MAX_EXPLICIT_DEPS 16  // Maximum explicit task dependencies per task
+// Task arguments — alias the common CORE_MAX_* constants (single source of
+// truth in src/common/task_interface/arg_direction.h, transitively included
+// via task_args.h above). Keeping the MAX_TENSOR_ARGS / MAX_SCALAR_ARGS names
+// because they are referenced widely in this runtime (pto_runtime2_types.h,
+// pto2_dispatch_payload.h, intrinsic.h comments).
+#define MAX_TENSOR_ARGS CORE_MAX_TENSOR_ARGS
+#define MAX_SCALAR_ARGS CORE_MAX_SCALAR_ARGS
 
 typedef enum {
-    PTO2_ASYNC_ENGINE_SDMA = 0,
-    PTO2_ASYNC_ENGINE_ROCE = 1,
-    PTO2_ASYNC_ENGINE_URMA = 2,
-    PTO2_ASYNC_ENGINE_CCU = 3,
-    PTO2_NUM_ASYNC_ENGINES = 4,
-} PTO2AsyncEngine;
+    ASYNC_ENGINE_SDMA = 0,
+    ASYNC_ENGINE_ROCE = 1,
+    ASYNC_ENGINE_URMA = 2,
+    ASYNC_ENGINE_CCU = 3,
+    NUM_ASYNC_ENGINES = 4,
+} AsyncEngine;
 
-enum class PTO2CompletionType : int32_t {
+enum class CompletionType : int32_t {
     COUNTER = 0,
 };
 
@@ -79,6 +79,23 @@ enum class PTO2ScopeMode : uint8_t {
  *
  * Users must hold a named TaskOutputTensors variable and borrow via get_ref();
  * binding get_ref() on an rvalue is compile-time rejected to prevent dangling.
+ *
+ * LIFETIME — single-scope only:
+ *   Internally this class stores pointers into the submitting task's payload
+ *   (PTO2TaskPayload::tensors[]), which lives in a ring-buffer slot. After
+ *   scope_end the slot becomes eligible for reuse, and a later submit will
+ *   overwrite the same Tensor storage in place. Therefore the
+ *   TaskOutputTensors instance, the const Tensor& returned by get_ref(), and
+ *   any pointer derived from either MUST NOT outlive the PTO2_SCOPE in which
+ *   submit was called — do not move/copy them to outer-scope variables, do
+ *   not capture references by std::reference_wrapper or raw pointers across
+ *   scope boundaries.
+ *
+ *   This invariant is intentionally not enforced at runtime: a reused slot
+ *   simply carries a different but valid owner_task_id, so checking
+ *   owner_task_id cannot distinguish "still mine" from "silently aliased to
+ *   an unrelated task". Misuse manifests as a wrong-tensor read with no
+ *   diagnostic.
  */
 class TaskOutputTensors {
 public:
@@ -98,7 +115,7 @@ public:
 
     /// Runtime-internal: append one materialized output Tensor.
     void materialize_output(const Tensor &tensor) {
-        always_assert(output_count_ < PTO2_MAX_OUTPUTS);
+        always_assert(output_count_ < MAX_TENSOR_ARGS);
         tensors_[output_count_++] = &tensor;
     }
 
@@ -109,7 +126,9 @@ public:
 private:
     PTO2TaskId task_id_;
     uint32_t output_count_;
-    const Tensor *tensors_[PTO2_MAX_OUTPUTS];
+    // Upper bound: a task cannot have more outputs than total tensor args
+    // (every OUTPUT/OUTPUT_EXISTING slot is one of the Arg's tensor slots).
+    const Tensor *tensors_[MAX_TENSOR_ARGS];
 };
 
 // =============================================================================
@@ -159,7 +178,8 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
 
     void clear() {
         TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, TensorArgType>::clear();
-        explicit_deps_.reset();
+        explicit_deps_ = nullptr;
+        explicit_dep_count_ = 0;
     }
 
     void reset() {
@@ -215,22 +235,50 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
         ((tensors_[tensor_count_].ptr = &args, tags_[tensor_count_] = TensorArgType::NO_DEP, tensor_count_++), ...);
     }
 
-    template <typename... TaskIds>
-    void add_dep(TaskIds... task_ids) {
-        static_assert(sizeof...(TaskIds) >= 1, "add_dep: at least one task id is required");
-        static_assert(
-            (std::is_same_v<std::decay_t<TaskIds>, PTO2TaskId> && ...), "add_dep: all arguments must be PTO2TaskId"
-        );
-        if (explicit_deps_.size() + sizeof...(TaskIds) > PTO2_MAX_EXPLICIT_DEPS) {
-            set_error("Too many explicit deps (exceeds explicit dependency capacity=16)");
+    /**
+     * Attach an explicit dependency array. The Arg stores (ptr, count) without
+     * copying — the caller's array must outlive the submit (same lifetime rule
+     * as add_input/add_output, which also store pointers).
+     *
+     * count == 0 is a valid "set empty" — it clears any previously stored deps
+     * and returns. This lets callers that build the dep set conditionally pass
+     * the result through unguarded, including in the no-dep branch:
+     *   PTO2TaskId deps[3];
+     *   uint32_t n = 0;
+     *   if (have_prev) deps[n++] = prev;
+     *   if (is_last)   deps[n++] = alloc;
+     *   args.set_dependencies(deps, n);    // safe even if n == 0
+     *
+     * For count > 0, the call is single-shot: a second non-empty call after
+     * deps are already set will fail with set_error(). Use count == 0 first
+     * if you need to re-set.
+     */
+    void set_dependencies(const PTO2TaskId *deps, uint32_t count) {
+        if (count == 0) {
+            explicit_deps_ = nullptr;
+            explicit_dep_count_ = 0;
             return;
         }
-        (explicit_deps_.add(task_ids), ...);
+        if (deps == nullptr) {
+            set_error("set_dependencies: deps must not be null when count > 0");
+            return;
+        }
+        if (explicit_deps_ != nullptr) {
+            set_error("set_dependencies: may be called at most once per Arg");
+            return;
+        }
+        explicit_deps_ = deps;
+        explicit_dep_count_ = count;
     }
 
-    uint32_t explicit_dep_count() const { return explicit_deps_.size(); }
+    uint32_t explicit_dep_count() const { return explicit_dep_count_; }
 
-    PTO2TaskId explicit_dep(uint32_t index) const { return explicit_deps_.get(index); }
+    PTO2TaskId explicit_dep(uint32_t index) const {
+        always_assert(index < explicit_dep_count_);
+        return explicit_deps_[index];
+    }
+
+    const PTO2TaskId *explicit_deps_data() const { return explicit_deps_; }
 
     /**
      * Add scalar values. Types are deduced per argument; each value is
@@ -309,29 +357,9 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
     }
 
 private:
-    struct ExplicitDepStorage {
-        PTO2TaskId task_ids[PTO2_MAX_EXPLICIT_DEPS]{};
-        uint32_t count{0};
-
-        void reset() { count = 0; }
-
-        bool add(PTO2TaskId task_id) {
-            if (count >= PTO2_MAX_EXPLICIT_DEPS) {
-                return false;
-            }
-            task_ids[count++] = task_id;
-            return true;
-        }
-
-        uint32_t size() const { return count; }
-
-        PTO2TaskId get(uint32_t index) const {
-            always_assert(index < count);
-            return task_ids[index];
-        }
-    };
-
-    ExplicitDepStorage explicit_deps_;
+    // Caller-owned dependency array; lifetime must extend through submit.
+    const PTO2TaskId *explicit_deps_{nullptr};
+    uint32_t explicit_dep_count_{0};
 
     template <bool is_output, typename... Args>
     bool check_add_tensor_valid(Args &&...) {

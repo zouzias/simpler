@@ -98,20 +98,45 @@ struct L2PerfRecord {
 static_assert(sizeof(L2PerfRecord) % 64 == 0, "L2PerfRecord must be 64-byte aligned for optimal cache performance");
 
 // =============================================================================
-// L2PerfBuffer - Fixed-Size Record Buffer with WIP Staging Slots
+// L2PerfAicoreRing - Stable AICore→AICPU Staging Ring (per core, never rotated)
+// =============================================================================
+
+/**
+ * Per-core staging ring written exclusively by AICore.
+ *
+ * AICore stores each task's timing in `dual_issue_slots[reg_task_id %
+ * PLATFORM_L2_AICORE_RING_SIZE]` and never touches any other L2Perf memory.
+ * The ring is allocated once by the host, addressed through
+ * `L2PerfBufferState[block_idx].aicore_ring_ptr` (also published into the
+ * `KernelArgs::aicore_ring_addr` table the AICore kernel entry forwards
+ * into `set_aicore_l2_perf_ring()`), and lives for the entire run — its
+ * address is never reassigned, decoupling AICore writes from the AICPU's
+ * records-buffer rotation.
+ *
+ * Sizing: PLATFORM_L2_AICORE_RING_SIZE must be ≥ in-flight issue depth on a
+ * single core (see runtime "completion-before-dispatch" invariant). The
+ * default 2 covers today's dual-issue dispatch.
+ */
+struct L2PerfAicoreRing {
+    L2PerfRecord dual_issue_slots[PLATFORM_L2_AICORE_RING_SIZE];
+} __attribute__((aligned(64)));
+
+// =============================================================================
+// L2PerfBuffer - Fixed-Size Record Buffer (AICPU-only)
 // =============================================================================
 
 /**
  * Fixed-size performance record buffer
  *
  * Capacity: PLATFORM_PROF_BUFFER_SIZE (defined in platform_config.h)
- * Allocated dynamically by Host, pushed into per-core free_queue.
+ * Allocated dynamically by Host, pushed into per-core free_queue, rotated
+ * by AICPU when full.
  *
- * WIP protocol: AICore writes timing to wip[reg_task_id & 1], AICPU copies
- * it into records[count] at completion. Dual-slot parity ensures no overlap.
+ * Owned and written exclusively by AICPU: AICore never touches this memory.
+ * AICPU reads timing from L2PerfAicoreRing::dual_issue_slots, fills in the
+ * AICPU-side fields, then commits into records[count++].
  */
 struct L2PerfBuffer {
-    L2PerfRecord wip[2];                              // AICore WIP staging slots (index = reg_task_id & 1)
     L2PerfRecord records[PLATFORM_PROF_BUFFER_SIZE];  // Committed records (AICPU writes)
     volatile uint32_t count;                          // Current committed record count
 } __attribute__((aligned(64)));
@@ -155,22 +180,43 @@ static_assert(sizeof(L2PerfFreeQueue) == 128, "L2PerfFreeQueue must be 128 bytes
  * - free_queue: SPSC queue of available buffer addresses
  * - current_buf_ptr: Currently active buffer being written (0 = no active buffer)
  * - current_buf_seq: Monotonic sequence number for ordering
+ * - aicore_ring_ptr: Stable per-core L2PerfAicoreRing address (L2PerfRecord
+ *   profiling only; unused by Phase profiling). Set by host at init, read by
+ *   AICPU in `l2_perf_aicpu_complete_record` to read the AICore-published
+ *   timing slots. Never reassigned during the run.
+ * - total_record_count / dropped_record_count / mismatch_record_count:
+ *   per-core/-thread tallies AICPU keeps so the host can cross-check
+ *   `collected + dropped + mismatch == device_total` at end-of-run. Replaces
+ *   the previous L2PerfDataHeader::total_tasks signal — the host no longer
+ *   needs to know task count up front. `mismatch_record_count` accounts for
+ *   ring slot/task_id invariant violations (a hard error class, distinct
+ *   from capacity drops).
  *
  * Used in two contexts:
- * - Per-core L2PerfRecord profiling (current_buf_ptr → L2PerfBuffer)
- * - Per-thread Phase profiling (current_buf_ptr → PhaseBuffer)
+ * - Per-core L2PerfRecord profiling (current_buf_ptr → L2PerfBuffer,
+ *   aicore_ring_ptr → L2PerfAicoreRing)
+ * - Per-thread Phase profiling (current_buf_ptr → PhaseBuffer,
+ *   aicore_ring_ptr / mismatch_record_count unused)
  *
  * Writers:
  * - free_queue.tail: Host writes (pushes new buffers)
  * - free_queue.head: Device writes (pops buffers)
  * - current_buf_ptr: Device writes (after pop), Host reads (for flush/collect)
  * - current_buf_seq: Device writes (monotonic counter)
+ * - aicore_ring_ptr: Host writes once at init, AICPU reads
+ * - total_record_count / dropped_record_count / mismatch_record_count:
+ *   Device writes, Host reads at drain time (no concurrency on a per-state
+ *   basis since each state belongs to a single core/thread)
  */
 struct L2PerfBufferState {
-    L2PerfFreeQueue free_queue;         // SPSC queue of free buffer addresses
-    volatile uint64_t current_buf_ptr;  // Current active buffer (0 = none)
-    volatile uint32_t current_buf_seq;  // Sequence number for ordering
-    uint32_t pad[13];                   // Pad to 192 bytes (aligned to cache line)
+    L2PerfFreeQueue free_queue;               // SPSC queue of free buffer addresses
+    volatile uint64_t current_buf_ptr;        // Current active buffer (0 = none)
+    volatile uint64_t aicore_ring_ptr;        // Stable AICore staging ring (L2Perf only; 0 for Phase)
+    volatile uint32_t current_buf_seq;        // Sequence number for ordering
+    volatile uint32_t total_record_count;     // Records the AICPU attempted to write to this state
+    volatile uint32_t dropped_record_count;   // Records dropped (queue full / overwrite / no buffer)
+    volatile uint32_t mismatch_record_count;  // Records lost to ring/task_id invariant violation (hard errors)
+    uint32_t pad[8];                          // Pad to 192 bytes (aligned to cache line)
 } __attribute__((aligned(64)));
 
 static_assert(sizeof(L2PerfBufferState) == 192, "L2PerfBufferState must be 192 bytes for cache alignment");
@@ -228,8 +274,7 @@ struct L2PerfDataHeader {
     volatile uint32_t queue_tails[PLATFORM_MAX_AICPU_THREADS];  // Producer write positions (AICPU modifies)
 
     // Metadata (Host initializes, Device read-only)
-    uint32_t num_cores;             // Actual number of cores launched
-    volatile uint32_t total_tasks;  // Total tasks (AICPU writes after orchestration)
+    uint32_t num_cores;  // Actual number of cores launched
 } __attribute__((aligned(64)));
 
 // =============================================================================
@@ -262,10 +307,15 @@ enum class AicpuPhaseId : uint32_t {
 };
 
 /**
- * Single AICPU scheduler phase record (32 bytes)
+ * Single AICPU scheduler phase record (40 bytes)
  *
  * Records one phase within one loop iteration of a scheduler thread.
  * No thread_id field: identity is derived from array index (position = identity).
+ *
+ * extra1 / extra2 carry phase-specific stats; meaning is keyed by phase_id:
+ *   SCHED_DISPATCH: extra1 = pop_hit delta since last emit
+ *                   extra2 = pop_miss delta since last emit
+ *   All other phases: extras are 0 (reserved for future per-phase metrics).
  */
 struct AicpuPhaseRecord {
     uint64_t start_time;    // Phase start timestamp
@@ -277,28 +327,26 @@ struct AicpuPhaseRecord {
                                    // (ring_id << 32) | local_id for cross-view correlation.
         uint64_t tasks_processed;  // Scheduler phases: number of tasks processed in this batch
     };
+    uint32_t extra1;  // Phase-specific delta (e.g. SCHED_DISPATCH = pop_hit)
+    uint32_t extra2;  // Phase-specific delta (e.g. SCHED_DISPATCH = pop_miss)
 };
+static_assert(sizeof(AicpuPhaseRecord) == 40, "AicpuPhaseRecord layout drift");
 
 /**
- * AICPU orchestrator cumulative summary
+ * AICPU orchestrator run summary
  *
- * Contains accumulated cycle counts from the orchestrator thread.
- * Written once after orchestration completes.
+ * Captures the orchestrator's overall run window. Per-phase breakdown is
+ * derived host-side by aggregating AicpuPhaseRecord entries filtered by
+ * phase_id, so per-phase cycle fields are not duplicated here. The
+ * device-side aggregate path under PTO2_ORCH_PROFILING (g_orch_*_cycle +
+ * LOG_INFO_V9) is independent and emits to the device log only.
  */
 struct AicpuOrchSummary {
-    uint64_t start_time;       // Orchestrator start timestamp
-    uint64_t end_time;         // Orchestrator end timestamp
-    uint64_t sync_cycle;       // sync_tensormap phase
-    uint64_t alloc_cycle;      // task_ring_alloc phase
-    uint64_t args_cycle;       // param_copy phase
-    uint64_t lookup_cycle;     // lookup+dep phase
-    uint64_t heap_cycle;       // heap_alloc phase
-    uint64_t insert_cycle;     // tensormap_insert phase
-    uint64_t fanin_cycle;      // fanin+ready phase
-    uint64_t scope_end_cycle;  // scope_end phase
-    int64_t submit_count;      // Total tasks submitted
-    uint32_t magic;            // Validation magic (AICPU_PHASE_MAGIC)
-    uint32_t padding;          // Alignment padding
+    uint64_t start_time;   // Orchestrator start timestamp
+    uint64_t end_time;     // Orchestrator end timestamp
+    int64_t submit_count;  // Total tasks submitted
+    uint32_t magic;        // Validation magic (AICPU_PHASE_MAGIC)
+    uint32_t padding;      // Alignment padding
 } __attribute__((aligned(64)));
 
 constexpr uint32_t AICPU_PHASE_MAGIC = 0x41435048;        // "ACPH"

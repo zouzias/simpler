@@ -11,56 +11,180 @@
 
 /**
  * @file pmu_collector.h
- * @brief Host-side PMU data collector (memcpy-based)
+ * @brief Host-side PMU buffer allocation, streaming collection, and CSV export.
  *
- * Design:
- *   1. Host pre-allocates one PmuBuffer per AICore on device, plus a single
- *      PmuSetupHeader that stores all buffer device pointers, core count,
- *      and the selected PMU event type.
- *   2. During execution, AICPU reads PMU MMIO counters after each task FIN
- *      and writes one PmuRecord into that core's PmuBuffer (silently
- *      incrementing PmuBufferState::dropped_record_count when the buffer is full).
- *   3. After stream sync, host copies the PmuBuffer header (to learn count)
- *      and then count*sizeof(PmuRecord) actual records back, per core.
- *   4. Host exports a LuoPan-compatible CSV under outputs/.
+ * Architecture:
+ * - BufferPoolManager<PmuModule>: shared mgmt-thread infrastructure that
+ *   polls per-thread PmuReadyQueues, drains the done_queue, and replenishes
+ *   the per-core free_queues from a unified recycled pool.
+ * - PmuCollector: collector thread pops full PmuBuffers from the manager
+ *   and appends them to the CSV file.
  *
- * halHostRegister is not supported on DAV_3510, so the collector uses
- * post-stream-sync memcpy rather than a shared-memory + SPSC-queue +
- * background-collector-thread streaming model.
+ * a5 specifics: device↔host transfers go through profiling_copy.h. The
+ * framework's mgmt loop mirrors the shm region per tick; per-buffer
+ * payloads (PmuBuffer) are pulled on demand inside ProfilerAlgorithms.
+ *
+ * Lifecycle:
+ *   init()                       — Allocate header + per-core states +
+ *                                  PmuBuffers (pre-fills free_queues; rest
+ *                                  go into the recycled pool). Calls
+ *                                  set_memory_context() on the base so
+ *                                  start(tf) can launch threads.
+ *   start(tf)                    — Inherited from ProfilerBase: assembles
+ *                                  MemoryOps from the stashed callbacks
+ *                                  and launches the mgmt + poll threads.
+ *   [device execution]
+ *   stop()                       — Stop mgmt → join mgmt → signal poll →
+ *                                  drain L2 → join poll, in that order. On
+ *                                  return both thread exits and queue
+ *                                  drains are complete.
+ *   reconcile_counters()         — Sanity-check PmuBufferState::current_buf_ptr
+ *                                  (any non-zero pointer with records is a
+ *                                  device-flush bug, logged as ERROR) and
+ *                                  run the device-side cross-check
+ *                                  collected + dropped == total.
+ *   finalize()                   — Free all device memory and unregister.
  */
 
 #ifndef SRC_A5_PLATFORM_INCLUDE_HOST_PMU_COLLECTOR_H_
 #define SRC_A5_PLATFORM_INCLUDE_HOST_PMU_COLLECTOR_H_
 
-#include <cerrno>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
+#include <functional>
+#include <mutex>
+#include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
-#include "common/pmu_profiling.h"
+#include "common/memory_barrier.h"
 #include "common/platform_config.h"
+#include "common/pmu_profiling.h"
 #include "common/unified_log.h"
+#include "host/profiling_common/profiler_base.h"
+
+// ---------------------------------------------------------------------------
+// PMU profiling Module (drives BufferPoolManager<PmuModule>)
+// ---------------------------------------------------------------------------
+
+/**
+ * One buffer kind (PmuBuffer); per-core buffer states. The collector
+ * pre-allocates PLATFORM_PMU_BUFFERS_PER_CORE buffers per core at init time
+ * to absorb steady-state load. process_entry refills the originating
+ * core's free_queue with exactly one buffer (recycled → drain done →
+ * alloc), and proactive_replenish tops up to SLOT_COUNT with a batch alloc
+ * when the recycled pool drains.
+ */
+
+/**
+ * Internal hand-off struct delivered from the mgmt thread to the
+ * collector. thread_index is the logical AICPU thread queue the entry was
+ * popped from, passed through by ProfilerBase's mgmt loop.
+ */
+struct PmuReadyBufferInfo {
+    uint32_t core_index;
+    uint32_t thread_index;
+    void *dev_buffer_ptr;
+    void *host_buffer_ptr;
+    uint32_t buffer_seq;
+};
+
+struct PmuModule {
+    using DataHeader = PmuDataHeader;
+    using ReadyEntry = PmuReadyQueueEntry;
+    using ReadyBufferInfo = ::PmuReadyBufferInfo;
+    using FreeQueue = PmuFreeQueue;
+
+    static constexpr int kBufferKinds = 1;
+    static constexpr uint32_t kReadyQueueSize = PLATFORM_PMU_READYQUEUE_SIZE;
+    static constexpr uint32_t kSlotCount = PLATFORM_PMU_SLOT_COUNT;
+    static constexpr const char *kSubsystemName = "PmuModule";
+
+    /**
+     * Buffers grown by proactive_replenish are batch-allocated up to the
+     * configured per-core ceiling minus the slot count, so a double-empty
+     * (recycled + done both dry) recovers in one tick.
+     */
+    static constexpr int batch_size(int /*kind*/) {
+        constexpr int kBatch = PLATFORM_PMU_BUFFERS_PER_CORE - PLATFORM_PMU_SLOT_COUNT;
+        return kBatch < 1 ? 1 : kBatch;
+    }
+
+    static DataHeader *header_from_shm(void *shm) { return get_pmu_header(shm); }
+
+    /**
+     * `count` is intentionally NOT reset here — AICPU is the sole writer
+     * and resets it itself when popping from free_queue.
+     */
+    static std::optional<profiling_common::EntrySite<PmuModule>>
+    resolve_entry(void *shm, DataHeader * /*header*/, int q, const ReadyEntry &entry) {
+        PmuBufferState *state = get_pmu_buffer_state(shm, static_cast<int>(entry.core_index));
+        profiling_common::EntrySite<PmuModule> site;
+        site.kind = 0;
+        site.free_queue = &state->free_queue;
+        site.buffer_size = sizeof(PmuBuffer);
+        site.info.core_index = entry.core_index;
+        site.info.thread_index = static_cast<uint32_t>(q);
+        site.info.dev_buffer_ptr = reinterpret_cast<void *>(entry.buffer_ptr);
+        site.info.host_buffer_ptr = nullptr;  // filled by ProfilerAlgorithms
+        site.info.buffer_seq = entry.buffer_seq;
+        return site;
+    }
+
+    template <typename Cb>
+    static void for_each_instance(void *shm, DataHeader *header, Cb &&cb) {
+        const int num_cores = static_cast<int>(header->num_cores);
+        for (int c = 0; c < num_cores; c++) {
+            PmuBufferState *state = get_pmu_buffer_state(shm, c);
+            cb(/*kind=*/0, &state->free_queue, sizeof(PmuBuffer));
+        }
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Memory operation callbacks (injected by DeviceRunner)
 // ---------------------------------------------------------------------------
 
-using PmuAllocCallback = void *(*)(size_t size);
-using PmuFreeCallback = int (*)(void *dev_ptr);
-using PmuCopyToDeviceCallback = int (*)(void *dev_dst, const void *host_src, size_t size);
-using PmuCopyFromDeviceCallback = int (*)(void *host_dst, const void *dev_src, size_t size);
+/**
+ * Allocate device memory.
+ *
+ * @param size       Bytes to allocate
+ * @param user_data  Opaque allocator context
+ * @return Device pointer, or nullptr on failure
+ */
+using PmuAllocCallback = void *(*)(size_t size, void *user_data);
+
+/**
+ * Register device memory for host-visible access. nullptr on a5 — the
+ * framework allocates a paired host shadow via malloc + memset 0 +
+ * copy_to_device. Stateless: HAL state is global, so no user_data is
+ * threaded through.
+ */
+using PmuRegisterCallback = int (*)(void *dev_ptr, size_t size, int device_id, void **host_ptr);
+
+/**
+ * Unregister a previously registered host-visible mapping. May be nullptr.
+ * Stateless (see register_cb).
+ */
+using PmuUnregisterCallback = int (*)(void *dev_ptr, int device_id);
+
+/**
+ * Free device memory.
+ */
+using PmuFreeCallback = int (*)(void *dev_ptr, void *user_data);
 
 // ---------------------------------------------------------------------------
 // PmuCollector
 // ---------------------------------------------------------------------------
 
-class PmuCollector {
+class PmuCollector : public profiling_common::ProfilerBase<PmuCollector, PmuModule> {
 public:
     PmuCollector() = default;
     ~PmuCollector();
@@ -68,66 +192,117 @@ public:
     PmuCollector(const PmuCollector &) = delete;
     PmuCollector &operator=(const PmuCollector &) = delete;
 
+    // ProfilerBase contract
+    static constexpr int kIdleTimeoutSec = PLATFORM_PMU_TIMEOUT_SECONDS;
+    static constexpr const char *kSubsystemName = "PMU";
+
     /**
-     * Allocate device-side PMU buffers and publish the setup header pointer.
+     * Allocate PMU shared memory and pre-populate per-core free_queues.
      *
-     * @param num_cores        Number of AICore instances to profile
-     * @param event_type       PmuEventType value (stored in header, used by AICPU)
-     * @param kernel_args_pmu_data_base Out: device address of PmuSetupHeader
-     * @param alloc_cb         Device memory alloc
-     * @param free_cb          Device memory free
-     * @param copy_to_dev_cb   Host→device (for publishing header)
-     * @param copy_from_dev_cb Device→host (for collect_all)
-     * @return 0 on success
+     * Allocates the PmuDataHeader + per-core PmuBufferState array, plus
+     * `num_cores * PLATFORM_PMU_BUFFERS_PER_CORE` PmuBuffers. The first
+     * PLATFORM_PMU_SLOT_COUNT buffers per core are pushed directly into
+     * that core's free_queue; the surplus go into the BufferPoolManager's
+     * shared recycled pool.
+     *
+     * @param num_cores                         Number of AICore instances in use
+     * @param num_threads                       Number of AICPU scheduling threads
+     * @param csv_path                          Output CSV path
+     * @param event_type                        PmuEventType selector (written
+     *                                          to PmuDataHeader::event_type
+     *                                          so AICPU can configure HW
+     *                                          counters)
+     * @param alloc_cb / register_cb / free_cb  Memory operation callbacks
+     *                                          (register_cb nullptr on a5)
+     * @param user_data                         Opaque pointer forwarded to callbacks
+     * @param device_id                         Device ID (for register_cb)
+     * @return 0 on success, non-zero on failure
      */
-    int initialize(
-        int num_cores, PmuEventType event_type, uint64_t *kernel_args_pmu_data_base, PmuAllocCallback alloc_cb,
-        PmuFreeCallback free_cb, PmuCopyToDeviceCallback copy_to_dev_cb, PmuCopyFromDeviceCallback copy_from_dev_cb
+    int init(
+        int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, PmuAllocCallback alloc_cb,
+        PmuRegisterCallback register_cb, PmuFreeCallback free_cb, void *user_data, int device_id
     );
 
     /**
-     * Copy all PMU buffers back from device. Fills collected_records_.
-     * Must be called after the execution stream has been fully synchronized.
+     * Device pointer to the PmuDataHeader. Set kernel_args.pmu_data_base
+     * to this after init() succeeds so the AICPU side can find the shared
+     * memory.
      */
-    int collect_all();
+    void *get_pmu_shm_device_ptr() const { return shm_dev_; }
 
     /**
-     * Export collected records to a LuoPan-compatible CSV under output_dir/.
+     * Device pointer to the per-core PmuAicoreRing-address table
+     * (uint64_t[num_cores]). Wire into
+     * `KernelArgs::aicore_pmu_ring_addrs`. Filled by the host at init.
      */
-    int export_csv(const std::string &output_dir);
+    void *get_aicore_ring_addrs_device_ptr() const { return aicore_ring_addrs_dev_; }
 
     /**
-     * Free all device buffers and reset host state.
+     * Per-buffer callback invoked by ProfilerBase's poll loop. Flushes
+     * records to CSV.
      */
-    int finalize();
+    void on_buffer_collected(const PmuReadyBufferInfo &info);
 
-    bool is_initialized() const { return setup_header_dev_ != nullptr; }
+    /**
+     * After stop(), perform purely-passive accounting:
+     *   - LOG_ERROR any non-zero PmuBufferState::current_buf_ptr with
+     *     records (device flush should always succeed-or-bump-dropped, so
+     *     a non-empty leftover indicates an AICPU flush bug — host does
+     *     NOT recover, to avoid masking the bug).
+     *   - Run the device-side cross-check:
+     *       collected + dropped == device_total.
+     * Must be called after stop(), so the AICPU-side flush has settled.
+     */
+    void reconcile_counters();
 
-    const std::vector<std::vector<PmuRecord>> &get_records() const { return collected_records_; }
+    /**
+     * Free all device memory and unregister mappings. Idempotent.
+     */
+    void finalize(PmuUnregisterCallback unregister_cb, PmuFreeCallback free_cb, void *user_data);
+
+    /**
+     * @return true if init() succeeded and finalize() has not run.
+     */
+    bool is_initialized() const { return initialized_; }
 
 private:
-    void *setup_header_dev_{nullptr};
-    std::vector<void *> core_buffers_dev_;  // PmuBuffer* per core (device)
-
-    int num_cores_{0};
+    bool initialized_ = false;
+    int num_cores_ = 0;
+    int num_threads_ = 0;
     PmuEventType event_type_{PmuEventType::PIPE_UTILIZATION};
-    size_t pmu_buffer_bytes_{0};
-    size_t setup_region_bytes_{0};
 
-    PmuAllocCallback alloc_cb_{nullptr};
-    PmuFreeCallback free_cb_{nullptr};
-    PmuCopyToDeviceCallback copy_to_dev_cb_{nullptr};
-    PmuCopyFromDeviceCallback copy_from_dev_cb_{nullptr};
+    // Shared memory region (PmuDataHeader + PmuBufferState[]). shm_host_ /
+    // device_id_ live on ProfilerBase (set via set_memory_context in init()).
+    void *shm_dev_ = nullptr;
 
-    // Host-side collected data (indexed by core id)
-    std::vector<std::vector<PmuRecord>> collected_records_;
-    std::vector<uint32_t> dropped_counts_;
-    std::vector<uint32_t> total_counts_;
-    std::vector<uint32_t> owning_thread_ids_;
+    // Per-core stable PmuAicoreRings + the per-core ring-address table that
+    // travels through KernelArgs into AICore platform state.
+    std::vector<void *> aicore_rings_dev_;
+    void *aicore_ring_addrs_dev_ = nullptr;
+    void *aicore_ring_addrs_host_ = nullptr;
+
+    // CSV output. File is opened lazily on the first record write so that
+    // a hung device run that produces no records does not leave a
+    // header-only CSV on disk.
+    std::string csv_path_;
+    std::string csv_header_;
+    std::ofstream csv_file_;
+    std::mutex csv_mutex_;
+
+    // Running total of records written to CSV. Used at reconcile time to
+    // verify collected + dropped == device_total.
+    uint64_t total_collected_ = 0;
+
+    PmuDataHeader *pmu_header() const { return get_pmu_header(shm_host_); }
+    PmuBufferState *pmu_state(int core_id) const { return get_pmu_buffer_state(shm_host_, core_id); }
+
+    void *alloc_single_buffer(size_t size, void **host_ptr_out);
+    void write_buffer_to_csv(int core_id, int thread_idx, const void *buf_host_ptr);
+    void ensure_csv_open_unlocked();
 };
 
 // ---------------------------------------------------------------------------
-// Utilities
+// Utility: resolve PMU event type (env-var override)
 // ---------------------------------------------------------------------------
 
 inline PmuEventType resolve_pmu_event_type(int requested_event_type) {
@@ -155,14 +330,17 @@ inline PmuEventType resolve_pmu_event_type(int requested_event_type) {
     return resolved;
 }
 
+/**
+ * Build the CSV path under the caller-provided per-task directory.
+ * Filename is fixed (no timestamp) — the directory is the per-task
+ * uniqueness boundary.
+ */
 inline std::string make_pmu_csv_path(const std::string &output_dir) {
     std::error_code ec;
     std::filesystem::create_directories(output_dir, ec);
     if (ec) {
         LOG_WARN("Failed to create PMU output directory %s: %s", output_dir.c_str(), ec.message().c_str());
     }
-    // Filename is fixed (no timestamp) — the caller-provided directory is the
-    // per-task uniqueness boundary.
     return output_dir + "/pmu.csv";
 }
 

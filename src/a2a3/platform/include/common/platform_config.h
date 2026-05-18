@@ -59,6 +59,21 @@ constexpr int PLATFORM_MAX_AICPU_THREADS = 4;
  */
 constexpr int PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH = 6;
 
+/**
+ * AICore op execution timeout (microseconds).
+ * Passed to aclrtSetOpExecuteTimeOutV2 so that STARS actively monitors
+ * AICore task execution and kills ops that exceed this threshold.
+ */
+constexpr uint64_t PLATFORM_OP_EXECUTE_TIMEOUT_US = 1000000;  // 1s
+
+/**
+ * Host-side stream synchronization timeout (milliseconds).
+ * Passed to aclrtSynchronizeStreamWithTimeout to detect stream sync hangs.
+ * Must be longer than PLATFORM_OP_EXECUTE_TIMEOUT_US to allow STARS
+ * enough time to kill the timed-out op and propagate the notification.
+ */
+constexpr int PLATFORM_STREAM_SYNC_TIMEOUT_MS = 2000;  // 2s (> op timeout 1s)
+
 // =============================================================================
 // Derived Platform Limits
 // =============================================================================
@@ -92,6 +107,16 @@ constexpr int PLATFORM_MAX_CORES = PLATFORM_MAX_BLOCKDIM * PLATFORM_CORES_PER_BL
  * Number of L2PerfRecord entries per dynamically allocated L2PerfBuffer
  */
 constexpr int PLATFORM_PROF_BUFFER_SIZE = 1000;
+
+/**
+ * Per-core AICore→AICPU staging ring slot count.
+ *
+ * AICore writes each task's timing into ring->dual_issue_slots[task_id %
+ * PLATFORM_L2_AICORE_RING_SIZE]. Must be a power of two and ≥ the in-flight
+ * issue depth on a single core. Today's runtime is dual-issue, so 2 slots
+ * suffice; raise to the next power of two when issue depth grows.
+ */
+constexpr int PLATFORM_L2_AICORE_RING_SIZE = 2;
 
 /**
  * Number of buffer slots per core/thread for dynamic profiling
@@ -129,14 +154,17 @@ constexpr int PLATFORM_PROF_READYQUEUE_SIZE =
 constexpr uint64_t PLATFORM_PROF_SYS_CNT_FREQ = 50000000;  // 50 MHz
 
 /**
+ * AICore deinit wait timeout (ticks at PLATFORM_PROF_SYS_CNT_FREQ).
+ * platform_deinit_aicore_regs waits for AICore to acknowledge the exit
+ * signal. If AICore is stuck (STARS-killed op, hardware fault), waiting
+ * forever blocks the AICPU scheduling thread. This timeout bounds the wait.
+ */
+constexpr uint64_t PLATFORM_DEINIT_TIMEOUT_TICKS = PLATFORM_PROF_SYS_CNT_FREQ;  // 1s
+
+/**
  * Timeout duration for performance data collection (seconds)
  */
 constexpr int PLATFORM_PROF_TIMEOUT_SECONDS = 30;
-
-/**
- * Number of empty polling iterations before checking timeout
- */
-constexpr int PLATFORM_PROF_EMPTY_POLLS_CHECK_NUM = 1000;
 
 inline double cycles_to_us(uint64_t cycles) {
     return (static_cast<double>(cycles) / PLATFORM_PROF_SYS_CNT_FREQ) * 1000000.0;
@@ -148,6 +176,7 @@ inline double cycles_to_us(uint64_t cycles) {
 #define PROFILING_FLAG_DUMP_TENSOR (1u << 0)
 #define PROFILING_FLAG_L2_SWIMLANE (1u << 1)
 #define PROFILING_FLAG_PMU (1u << 2)
+#define PROFILING_FLAG_DEP_GEN (1u << 3)
 #define GET_PROFILING_FLAG(flags, bit) ((((uint32_t)(flags)) & ((uint32_t)(bit))) != 0u)
 #define SET_PROFILING_FLAG(flags, bit) ((flags) |= (uint32_t)(bit))
 #define CLEAR_PROFILING_FLAG(flags, bit) ((flags) &= ~((uint32_t)(bit)))
@@ -227,6 +256,39 @@ constexpr int PLATFORM_PMU_READYQUEUE_SIZE = PLATFORM_MAX_CORES * PLATFORM_PMU_B
  * Idle timeout duration for PMU collection (seconds)
  */
 constexpr int PLATFORM_PMU_TIMEOUT_SECONDS = 30;
+
+// =============================================================================
+// dep_gen (SubmitTrace) Configuration
+// =============================================================================
+
+/**
+ * Number of DepGenRecord entries per DepGenBuffer.
+ * Each DepGenRecord is ~2.3 KB (16 Tensor blobs + small header), so a buffer
+ * of 32 records is ~74 KB — sized to fit a typical example's submit count
+ * (~100-200) in a few buffers.
+ */
+constexpr int PLATFORM_DEP_GEN_RECORDS_PER_BUFFER = 32;
+
+/**
+ * SPSC free_queue slot count for dep_gen buffers (Host→Device hand-off depth).
+ */
+constexpr int PLATFORM_DEP_GEN_SLOT_COUNT = 4;
+
+/**
+ * Pre-allocated DepGenBuffer count per orchestrator instance.
+ */
+constexpr int PLATFORM_DEP_GEN_BUFFERS_PER_INSTANCE = 4;
+
+/**
+ * Ready queue capacity for dep_gen (per AICPU thread). dep_gen is single-
+ * instance so headroom over BUFFERS_PER_INSTANCE × num_instances is small.
+ */
+constexpr int PLATFORM_DEP_GEN_READYQUEUE_SIZE = PLATFORM_DEP_GEN_BUFFERS_PER_INSTANCE * 2;
+
+/**
+ * Idle timeout duration for dep_gen collection (seconds).
+ */
+constexpr int PLATFORM_DEP_GEN_TIMEOUT_SECONDS = 30;
 
 // =============================================================================
 // Register Communication Configuration
