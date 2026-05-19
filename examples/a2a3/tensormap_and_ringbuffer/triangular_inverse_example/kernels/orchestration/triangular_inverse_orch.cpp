@@ -9,22 +9,18 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * BGEMM Orchestration Function (tensormap_and_ringbuffer Runtime)
+ * Triangular Inverse Orchestration (tensormap_and_ringbuffer Runtime)
  *
- * Builds the task graph for tiled matrix multiplication: C = A @ B
+ * Builds the task graph for batch triangular matrix inversion.
  *
- * Configuration read from scalar args (set in golden.py):
- *   - tile_size: tile dimension (tile_size x tile_size per tile)
- *   - grid_k: number of K-dimension partitions
- *   - num_groups: number of independent groups (= matmul_add_task_num / grid_k)
- *   - incore_loop: number of tiles per group
+ * Arg layout (set in test_triangular_inverse.py):
+ *   tensor(0) = M      (INPUT)  fp16 triangular matrices [num_matrices * N * N]
+ *   tensor(1) = I_neg  (INPUT)  fp16 negative identity   [N * N]
+ *   tensor(2) = M_inv  (OUTPUT) fp16 result              [num_matrices * N * N]
+ *   tensor(3) = config (INPUT)  int64[3]: [matrix_size, num_matrices, is_lower]
  *
- * Memory layout (tile-first, flattened):
- *   A: [num_groups, grid_k, incore_loop, tile_size, tile_size]
- *   B: [num_groups, grid_k, incore_loop, tile_size, tile_size]
- *   C: [incore_loop * num_groups, tile_size, tile_size]
- *
- * Arg layout: [A, B, C, config]
+ * The single AIC task (func_id=0) receives these four args in the same order
+ * and dispatches to run_tri_inv_rec_unroll_per_num_matrices.
  */
 
 #include <stddef.h>
@@ -32,53 +28,41 @@
 
 #include "pto_orchestration_api.h"  // NOLINT(build/include_subdir)
 
-#define FUNC_GEMM_TILE 0
-#define FUNC_TILE_ADD 1
+#define FUNC_TRI_INV 0
 
 extern "C" {
 
 __attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
-    (void)orch_args;  // NOLINT(readability/casting)
+aicpu_orchestration_config(const ChipStorageTaskArgs& orch_args) {
+    (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 4,
     };
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args) {
-    // Tensor args
-    Tensor ext_A = from_tensor_arg(orch_args.tensor(0));
-    Tensor ext_B = from_tensor_arg(orch_args.tensor(1));
-    Tensor ext_C = from_tensor_arg(orch_args.tensor(2));
+__attribute__((visibility("default"))) void
+aicpu_orchestration_entry(const ChipStorageTaskArgs& orch_args) {
+    Tensor ext_M      = from_tensor_arg(orch_args.tensor(0));
+    Tensor ext_I_neg  = from_tensor_arg(orch_args.tensor(1));
+    Tensor ext_M_inv  = from_tensor_arg(orch_args.tensor(2));
     Tensor ext_config = from_tensor_arg(orch_args.tensor(3));
 
-    // Read config from tensor data: [tile_size, grid_k, num_groups, incore_loop]
-    int64_t *host_config = orch_args.tensor(3).data_as<int64_t>();
-    int tile_size = static_cast<int>(host_config[0]);
-    int grid_k = static_cast<int>(host_config[1]);
-    int num_groups = static_cast<int>(host_config[2]);
-    int incore_loop = static_cast<int>(host_config[3]);
-    uint64_t tile_elems = static_cast<uint64_t>(tile_size) * tile_size;
-
-    int grid_m = 1;
-    int grid_n = 1;
+    int64_t* host_config = orch_args.tensor(3).data_as<int64_t>();
+    int matrix_size  = static_cast<int>(host_config[0]);
+    int num_matrices = static_cast<int>(host_config[1]);
+    int is_lower     = static_cast<int>(host_config[2]);
 
     LOG_INFO_V0(
-        "[bgemm_orch] tile_size: %d, grid_m: %d, grid_n: %d, grid_k: %d, num_groups: %d, incore_loop: %d", tile_size,
-        grid_m, grid_n, grid_k, num_groups, incore_loop
+        "[tri_inv_orch] matrix_size: %d, num_matrices: %d, is_lower: %d",
+        matrix_size, num_matrices, is_lower
     );
 
-    uint32_t tile_shapes[1] = {static_cast<uint32_t>(tile_elems)};
-    uint64_t group_tile_elems = static_cast<uint64_t>(incore_loop) * tile_elems;
-    uint32_t group_shapes[1] = {static_cast<uint32_t>(group_tile_elems)};
-    TensorCreateInfo group_ci(group_shapes, 1, DataType::FLOAT32);
-
-    Arg params_gemm;
-    params_gemm.add_input(ext_A);
-    params_gemm.add_input(ext_B);
-    params_gemm.add_output(ext_C);
-    params_gemm.add_input(ext_config);
-    TaskOutputTensors gemm_outs = rt_submit_aic_task(FUNC_GEMM_TILE, params_gemm);
+    Arg params;
+    params.add_input(ext_M);
+    params.add_input(ext_I_neg);
+    params.add_output(ext_M_inv);
+    params.add_input(ext_config);
+    rt_submit_aic_task(FUNC_TRI_INV, params);
 }
 
 }  // extern "C"
