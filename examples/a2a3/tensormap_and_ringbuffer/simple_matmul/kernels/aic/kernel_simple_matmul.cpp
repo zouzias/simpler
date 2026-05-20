@@ -172,13 +172,15 @@ AICORE void run_simple_matmul(__gm__ T *a, __gm__ T *b, __gm__ float *c, uint32_
  */
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
     // Unpack arguments (Tensor* pointers from runtime)
-    __gm__ float *a = reinterpret_cast<__gm__ float *>(args[0]);
-    __gm__ float *b = reinterpret_cast<__gm__ float *>(args[1]);
-    __gm__ float *c = reinterpret_cast<__gm__ float *>(args[2]);
     __gm__ Tensor *config = reinterpret_cast<__gm__ Tensor *>(args[3]);
 
     __gm__ int64_t *cfg = reinterpret_cast<__gm__ int64_t *>(config->buffer.addr);
     const uint64_t batch_size = static_cast<uint64_t>(cfg[0]);
     const uint64_t matrix_size = static_cast<uint64_t>(cfg[1]);
+
+    __gm__ float *a = reinterpret_cast<__gm__ float *>(args[0]) + get_block_idx() * matrix_size * matrix_size;
+    __gm__ float *b = reinterpret_cast<__gm__ float *>(args[1]) + get_block_idx() * matrix_size * matrix_size;
+    __gm__ float *c = reinterpret_cast<__gm__ float *>(args[2]) + get_block_idx() * matrix_size * matrix_size;
+
     run_simple_matmul(a, b, c, matrix_size);
 }
