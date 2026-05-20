@@ -15,6 +15,7 @@ from simpler.task_interface import ArgDirection as D
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
 
+
 def random_tri_matrix(n, block_dim_x, block_dim_y, scale=0.1, is_lower=False):
     if is_lower:
         return scale * torch.tril(
@@ -24,6 +25,7 @@ def random_tri_matrix(n, block_dim_x, block_dim_y, scale=0.1, is_lower=False):
         return scale * torch.triu(
             torch.rand((block_dim_x, block_dim_y, n, n)), diagonal=1
         )
+
 
 def linalg_inv(A: torch.tensor) -> torch.tensor:
     assert A.ndim == 4, "Expected 4D tensor"
@@ -39,10 +41,11 @@ def linalg_inv(A: torch.tensor) -> torch.tensor:
             )
     return torch.from_numpy(golden_numpy).to(in_dtype)
 
+
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")
 class TestTriangularInverse(SceneTestCase):
     # fp16 arithmetic — use tolerances appropriate for half-precision results
-    RTOL = 1e-2
+    RTOL = 1e-5
     ATOL = 1e-2
 
     CALLABLE = {
@@ -66,7 +69,7 @@ class TestTriangularInverse(SceneTestCase):
         {
             "name": "Case_upper_tri_matrix_size_32",
             "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": 4, "block_dim": 16},
+            "config": {"aicpu_thread_num": 4, "block_dim": 1},
             "params": {"num_matrices": 1, "matrix_size": 32, "is_lower": 0},
         },
         {
@@ -94,9 +97,15 @@ class TestTriangularInverse(SceneTestCase):
         # Build well-conditioned triangular matrices in fp16.
         # Start with random values and zero out the off-triangle, then set
         # the diagonal to a value in [0.5, 1.5] to ensure invertibility.
-        M_fp16 = random_tri_matrix(n, 1, num_matrices, is_lower=is_lower).to(torch.float16)
-        I_neg = -torch.eye(n, dtype=torch.float16)
-        M_inv = torch.zeros((num_matrices, 1, n , n), dtype=torch.float16)  
+        M_fp16 = (
+            random_tri_matrix(n, 1, num_matrices, is_lower=is_lower)
+            .to(torch.float16)
+            .contiguous()
+        )
+        I_neg = -torch.eye(
+            n, dtype=torch.float16
+        ).contiguous()  # Identity matrix for use in the kernel, negated to match the kernel's expected input
+        M_inv = torch.zeros((num_matrices, 1, n, n), dtype=torch.float16)
         config = torch.tensor([n, num_matrices, is_lower, block_dim], dtype=torch.int64)
 
         return TaskArgsBuilder(
@@ -109,9 +118,9 @@ class TestTriangularInverse(SceneTestCase):
     def compute_golden(self, args, params):
         n = params["matrix_size"]
         num_matrices = params["num_matrices"]
-        M = args.M.reshape(num_matrices,1, n, n).to(torch.float16)
+        M = args.M.reshape(num_matrices, 1, n, n).to(torch.float16)
         M_inv = linalg_inv(M)
-        print("M_inv (golden):", M_inv)
+        print("M_inv (golden):", M_inv.flatten()[:10])
         return M_inv
 
 

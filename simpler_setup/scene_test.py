@@ -630,6 +630,8 @@ def _compare_outputs(test_args, golden_args, output_names, rtol, atol):
     for name in output_names:
         actual = getattr(test_args, name)
         expected = getattr(golden_args, name)
+        print("actual: ", actual[:10])
+        print("diff: ", (actual - expected).abs().mean().item())
         if not torch.allclose(actual, expected, rtol=rtol, atol=atol):
             diff = (actual - expected).abs().max().item()
             raise AssertionError(f"Golden mismatch on '{name}': max_diff={diff}, rtol={rtol}, atol={atol}")
