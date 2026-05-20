@@ -21,7 +21,7 @@
  *   args[0] = input_a (INPUT)
  *   args[1] = input_b (INPUT)
  *   args[2] = output  (OUTPUT)
- *   args[3] = config  (INPUT) - int64_t[4]: [batch_size, matrix_size]
+ *   args[3] = config  (INPUT) - int64_t[2]: [batch_size, matrix_size]
  */
 
 #include <cstdint>
@@ -172,13 +172,13 @@ AICORE void run_simple_matmul(__gm__ T *a, __gm__ T *b, __gm__ float *c, uint32_
  */
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
     // Unpack arguments (Tensor* pointers from runtime)
-    __gm__ Tensor *a = reinterpret_cast<__gm__ Tensor *>(args[0]);
-    __gm__ Tensor *b = reinterpret_cast<__gm__ Tensor *>(args[1]);
-    __gm__ Tensor *c = reinterpret_cast<__gm__ Tensor *>(args[2]);
+    __gm__ float *a = reinterpret_cast<__gm__ float *>(args[0]);
+    __gm__ float *b = reinterpret_cast<__gm__ float *>(args[1]);
+    __gm__ float *c = reinterpret_cast<__gm__ float *>(args[2]);
     __gm__ Tensor *config = reinterpret_cast<__gm__ Tensor *>(args[3]);
 
     __gm__ int64_t *cfg = reinterpret_cast<__gm__ int64_t *>(config->buffer.addr);
-    const uint64_t tile_size = static_cast<uint64_t>(cfg[0]);
-    uint64_t tile_elems = tile_size * tile_size;
-    const int num_tiles = static_cast<uint64_t>(cfg[3]);
+    const uint64_t batch_size = static_cast<uint64_t>(cfg[0]);
+    const uint64_t matrix_size = static_cast<uint64_t>(cfg[1]);
+    run_simple_matmul(a, b, c, matrix_size);
 }
