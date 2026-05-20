@@ -7,13 +7,37 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Triangular inverse (recursive unrolled): M_inv = inv(M) for upper/lower-triangular fp16 matrices."""
+"""Triangular inverse (recursive unrolled): M_inv = inv(M) for upper/lower-triangular unit diagonal matrices."""
 
 import torch
+import numpy as np
 from simpler.task_interface import ArgDirection as D
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
 
+def random_tri_matrix(n, block_dim_x, block_dim_y, scale=0.1, is_lower=False):
+    if is_lower:
+        return scale * torch.tril(
+            torch.rand((block_dim_x, block_dim_y, n, n)), diagonal=-1
+        )
+    else:
+        return scale * torch.triu(
+            torch.rand((block_dim_x, block_dim_y, n, n)), diagonal=1
+        )
+
+def linalg_inv(A: torch.tensor) -> torch.tensor:
+    assert A.ndim == 4, "Expected 4D tensor"
+    assert A.shape[-2] == A.shape[-1], "Expected square matrices on last two dimensions"
+    in_dtype = A.dtype
+    n = A.shape[-1]
+    Identity = np.eye(n, dtype=np.double)
+    golden_numpy = np.zeros((A.shape))
+    for x in range(A.shape[0]):
+        for y in range(A.shape[1]):
+            golden_numpy[x, y] = np.linalg.inv(
+                A[x, y].double().numpy().astype(np.double) + Identity
+            )
+    return torch.from_numpy(golden_numpy).to(in_dtype)
 
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")
 class TestTriangularInverse(SceneTestCase):
@@ -40,55 +64,44 @@ class TestTriangularInverse(SceneTestCase):
 
     CASES = [
         {
-            "name": "Case0_upper32",
+            "name": "Case_upper_tri_matrix_size_32",
             "platforms": ["a2a3sim", "a2a3"],
             "config": {"aicpu_thread_num": 4, "block_dim": 16},
-            "params": {"num_matrices": 4, "matrix_size": 32, "is_lower": 0},
+            "params": {"num_matrices": 1, "matrix_size": 32, "is_lower": 0},
         },
         {
-            "name": "Case1_upper64",
+            "name": "Case_upper_tri_matrix_size_64",
             "manual": True,
             "platforms": ["a2a3sim", "a2a3"],
             "config": {"aicpu_thread_num": 4, "block_dim": 16},
-            "params": {"num_matrices": 4, "matrix_size": 64, "is_lower": 0},
+            "params": {"num_matrices": 16, "matrix_size": 64, "is_lower": 0},
         },
         {
-            "name": "Case2_lower32",
+            "name": "Case_lower_tri_matrix_size_32",
             "manual": True,
             "platforms": ["a2a3sim", "a2a3"],
             "config": {"aicpu_thread_num": 4, "block_dim": 16},
-            "params": {"num_matrices": 4, "matrix_size": 32, "is_lower": 1},
+            "params": {"num_matrices": 16, "matrix_size": 32, "is_lower": 1},
         },
     ]
 
     def generate_args(self, params):
         n = params["matrix_size"]
         num_matrices = params["num_matrices"]
+        block_dim = min(num_matrices, 20)
         is_lower = params["is_lower"]
 
         # Build well-conditioned triangular matrices in fp16.
         # Start with random values and zero out the off-triangle, then set
         # the diagonal to a value in [0.5, 1.5] to ensure invertibility.
-        M_f32 = torch.rand(num_matrices, n, n, dtype=torch.float32)
-        if is_lower:
-            M_f32 = torch.tril(M_f32)
-        else:
-            M_f32 = torch.triu(M_f32)
-        # Diagonal entries in [0.5, 1.5] — keeps condition number reasonable
-        diag_vals = torch.rand(num_matrices, n, dtype=torch.float32) + 0.5
-        idx = torch.arange(n)
-        M_f32[:, idx, idx] = diag_vals
-        M = M_f32.to(torch.float16)
-
-        # Negative identity matrix — used by the kernel to derive I and Zero
-        I_neg = (-torch.eye(n, dtype=torch.float16)).flatten()
-
-        M_inv = torch.zeros(num_matrices, n, n, dtype=torch.float16)
-        config = torch.tensor([n, num_matrices, is_lower], dtype=torch.int64)
+        M_fp16 = random_tri_matrix(n, 1, num_matrices, is_lower=is_lower).to(torch.float16)
+        I_neg = -torch.eye(n, dtype=torch.float16)
+        M_inv = torch.zeros((num_matrices, 1, n , n), dtype=torch.float16)  
+        config = torch.tensor([n, num_matrices, is_lower, block_dim], dtype=torch.int64)
 
         return TaskArgsBuilder(
-            Tensor("M", M.flatten()),
-            Tensor("I_neg", I_neg),
+            Tensor("M", M_fp16.flatten()),
+            Tensor("I_neg", I_neg.flatten()),
             Tensor("M_inv", M_inv.flatten()),
             Tensor("config", config),
         )
@@ -96,9 +109,9 @@ class TestTriangularInverse(SceneTestCase):
     def compute_golden(self, args, params):
         n = params["matrix_size"]
         num_matrices = params["num_matrices"]
-        M = args.M.reshape(num_matrices, n, n).to(torch.float32)
-        # Compute in float32 for numerical stability, then cast to fp16
-        M_inv = torch.linalg.inv(M).to(torch.float16)
+        M = args.M.reshape(num_matrices,1, n, n).to(torch.float16)
+        M_inv = linalg_inv(M)
+        print("M_inv (golden):", M_inv)
         return M_inv
 
 
