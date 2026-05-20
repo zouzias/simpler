@@ -182,5 +182,5 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     __gm__ float *b = reinterpret_cast<__gm__ float *>(args[1]) + get_block_idx() * matrix_size * matrix_size;
     __gm__ float *c = reinterpret_cast<__gm__ float *>(args[2]) + get_block_idx() * matrix_size * matrix_size;
 
-    run_simple_matmul(a, b, c, matrix_size);
+    run_simple_matmul<float>(a, b, c, matrix_size);
 }
